@@ -1,0 +1,60 @@
+{
+  "name": "@avodotso/market-sdk",
+  "version": "0.1.0",
+  "description": "TypeScript client for the Avo Portfolio API. Bootstrap a market-maker agent, run rebalances, push NAV updates — custodial or self-custodial.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepublishOnly": "yarn clean && yarn build && yarn test"
+  },
+  "keywords": [
+    "solana",
+    "avo-portfolio",
+    "market-maker",
+    "rebalance",
+    "nav",
+    "sdk",
+    "client"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/avodotso/market-sdk.git"
+  },
+  "bugs": {
+    "url": "https://github.com/avodotso/market-sdk/issues"
+  },
+  "homepage": "https://github.com/avodotso/market-sdk#readme",
+  "license": "ISC",
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org",
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "bs58": "^6.0.0",
+    "tweetnacl": "^1.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.7.3",
+    "vitest": "^2.1.9"
+  }
+}

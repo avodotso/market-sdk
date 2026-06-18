@@ -1,0 +1,124 @@
+name: Publish @avodotso/market-sdk
+
+# Trigger on every push to `main` plus the manual dispatch button. The
+# "version bumped?" check below early-exits the workflow when
+# `package.json` hasn't moved, so feature commits don't trigger publishes.
+#
+# Tag-pushes also fire — the tag-version-match gate enforces parity with
+# `package.json` so `v1.2.3` can never publish `1.2.2` by accident.
+on:
+  push:
+    branches: [main]
+    tags:
+      - 'v*'
+  workflow_dispatch: {}
+
+# Public-npm publishes use an `NPM_TOKEN` repo secret (granular automation
+# token scoped to `@avodotso`). Provenance is off because we're not
+# requiring a public source repo — flip back on when this repo is public
+# by adding `id-token: write` here and `--provenance` to the publish step.
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Check version bump
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.local.outputs.version }}
+      should_publish: ${{ steps.compare.outputs.should_publish }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read local package.json version
+        id: local
+        run: |
+          version=$(node -p "require('./package.json').version")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "package.json version is $version"
+
+      - name: Query npm for the latest published version
+        id: npm
+        run: |
+          pkg=$(node -p "require('./package.json').name")
+          # `npm view ... version` exits 0 with empty stdout when nothing's
+          # published yet, exits 1 (E404) when the package itself doesn't
+          # exist. Treat both as "no published version".
+          if remote=$(npm view "$pkg" version 2>/dev/null) && [ -n "$remote" ]; then
+            echo "remote=$remote" >> "$GITHUB_OUTPUT"
+            echo "latest on npm is $remote"
+          else
+            echo "remote=" >> "$GITHUB_OUTPUT"
+            echo "no published version on npm yet"
+          fi
+
+      - name: Compare versions
+        id: compare
+        run: |
+          local="${{ steps.local.outputs.version }}"
+          remote="${{ steps.npm.outputs.remote }}"
+          if [ -z "$remote" ]; then
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+            echo "First publish of this package."
+          elif [ "$local" = "$remote" ]; then
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::package.json ($local) matches npm latest ($remote); skipping publish."
+          else
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+            echo "package.json ($local) differs from npm latest ($remote); publishing."
+          fi
+
+  publish:
+    name: Publish to npm
+    needs: check
+    if: needs.check.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          # Pre-configures `.npmrc` to use the public npm registry for the
+          # `@avodotso` scope. NODE_AUTH_TOKEN is wired below.
+          registry-url: 'https://registry.npmjs.org'
+          scope: '@avodotso'
+
+      # Tag-version invariant: when a `v*` tag triggered this run, the
+      # tag's version segment must equal package.json's version. Catches
+      # "forgot to bump package.json before tagging" — npm versions are
+      # immutable, so the cost of publishing the wrong version is high.
+      - name: Verify tag matches package.json version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag_version="${GITHUB_REF#refs/tags/v}"
+          pkg_version="${{ needs.check.outputs.version }}"
+          if [ "$tag_version" != "$pkg_version" ]; then
+            echo "::error::tag is v$tag_version but package.json has version $pkg_version"
+            exit 1
+          fi
+          echo "tag and package.json both say $pkg_version"
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      # `prepublishOnly` already runs clean + build + test — invoke them
+      # explicitly here so a failure shows up as its own step in the
+      # workflow log instead of getting tangled in npm publish output.
+      - name: Build
+        run: yarn build
+
+      - name: Test
+        run: yarn test
+
+      - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
+
+      - name: Summary
+        run: |
+          version="${{ needs.check.outputs.version }}"
+          echo "## Published @avodotso/market-sdk@$version" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Available at: https://www.npmjs.com/package/@avodotso/market-sdk/v/$version" >> "$GITHUB_STEP_SUMMARY"
