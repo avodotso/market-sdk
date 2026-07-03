@@ -22,7 +22,7 @@ You hold a bearer token (returned from `finalizeCreateMarket` or `registerMarket
 import { MarketClient } from '@avodotso/market-sdk';
 
 const client = new MarketClient({
-  services: { avoApi: 'https://api.avo.so' },
+  services: { avoApi: 'https://portfolio-contract-api-service-dev.up.railway.app' },
   agent: { bearer: process.env.AGENT_BEARER! },
 });
 
@@ -55,7 +55,7 @@ import { Keypair } from '@solana/web3.js';
 const agentKp = Keypair.fromSecretKey(/* your agent's 64-byte secret key */);
 
 const client = new MarketClient({
-  services: { avoApi: 'https://api.avo.so' },
+  services: { avoApi: 'https://portfolio-contract-api-service-dev.up.railway.app' },
   agent: {
     publicKey: agentKp.publicKey.toBytes(),
     secretKey: agentKp.secretKey,
@@ -75,7 +75,7 @@ The API generates a fresh agent keypair custodially. You sign the funding tx wit
 import { MarketClient } from '@avodotso/market-sdk';
 import { VersionedTransaction } from '@solana/web3.js';
 
-const client = new MarketClient({ services: { avoApi: 'https://api.avo.so' } });
+const client = new MarketClient({ services: { avoApi: 'https://portfolio-contract-api-service-dev.up.railway.app' } });
 
 // Phase 1: register intent + receive an unsigned 0.1 SOL funding tx.
 const prep = await client.prepareCreateMarket({
@@ -171,7 +171,7 @@ The agent's secret key stays encrypted inside the API. You only hold the one-tim
 
 ```ts
 new MarketClient({
-  services: { avoApi: 'https://api.avo.so' },
+  services: { avoApi: 'https://portfolio-contract-api-service-dev.up.railway.app' },
   agent: {
     bearer: 'mb_8e3f…',                // stored from finalizeCreateMarket
     publicKey: kp.publicKey.toBytes(), // optional; enables getOwnIdentity()
@@ -250,7 +250,7 @@ const { token, expiresAtMs } = await mintAuthToken({
 import { resolveServiceConfig } from '@avodotso/market-sdk';
 
 const services = resolveServiceConfig({
-  avoApi: 'https://api.avo.so',
+  avoApi: 'https://portfolio-contract-api-service-dev.up.railway.app',
 });
 
 const client = new MarketClient({ services });
@@ -260,7 +260,7 @@ You can pass a custom `fetch` for testing or instrumentation:
 
 ```ts
 new MarketClient({
-  services: { avoApi: 'https://api.avo.so' },
+  services: { avoApi: 'https://portfolio-contract-api-service-dev.up.railway.app' },
   fetch: myInstrumentedFetch,
 });
 ```
