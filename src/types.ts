@@ -286,6 +286,15 @@ export interface RebalanceBody {
   onlyDirectRoutes?: boolean;
   dexes?: string;
   excludeDexes?: string;
+  /**
+   * Clamp `new_total_value_base` per leg into ±20% of the on-chain
+   * cache so `rebalance_leg`'s `MAX_NAV_DELTA_BPS` guard doesn't reject
+   * a legitimate but stale NAV update. Enable for intermittent-trading
+   * markets (RWAs / xStocks / Mag-7-style indices) where the cache
+   * routinely drifts > 20% between rebalances. Off by default so 24/7
+   * markets still surface real fat-finger anomalies.
+   */
+  capNavDelta?: boolean;
 }
 
 export interface RebalanceLegResult {

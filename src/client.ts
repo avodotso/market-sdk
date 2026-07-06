@@ -217,6 +217,52 @@ export class MarketClient extends HttpBase {
   }
 
   /**
+   * One-shot wrapper around `prepareCreateMarket` → operator-side
+   * funding-tx signing → `finalizeCreateMarket`. Returns the same
+   * `FinalizeCreateMarketResp` as a manual two-step flow.
+   *
+   * The API server registers a shadow portfolio in portfolio-service
+   * as part of `finalizeCreateMarket` and seeds it with a first
+   * rebalance — that's what makes the `/market/[pda]` chart and Tokens
+   * tab populate without any additional client calls. **Everything
+   * needed to get the chart working is set up by this single method.**
+   *
+   * The caller supplies a `signFundingTx` callback that takes the
+   * base64-encoded unsigned `VersionedTransaction` from phase 1, signs
+   * + submits it via the operator's wallet, and returns the Solana
+   * signature. This SDK never touches the operator's signing material.
+   *
+   * Example with Dynamic's Solana adapter:
+   * ```ts
+   * await client.createMarketWithShadowPortfolio(body, async (txBase64) => {
+   *   const tx = VersionedTransaction.deserialize(Buffer.from(txBase64, 'base64'));
+   *   const result = await primaryWallet.signAndSendTransaction(tx);
+   *   return typeof result === 'string' ? result : result.signature;
+   * });
+   * ```
+   */
+  async createMarketWithShadowPortfolio(
+    body: PrepareCreateMarketBody,
+    signFundingTx: (fundingTxBase64: string) => Promise<string>,
+  ): Promise<FinalizeCreateMarketResp> {
+    const prep = await this.prepareCreateMarket(body);
+    const fundingSignature = await signFundingTx(prep.fundingTx);
+    if (!fundingSignature || typeof fundingSignature !== 'string') {
+      throw new AvoSdkError({
+        status: 500,
+        code: 'INVALID_FUNDING_SIGNATURE',
+        message:
+          'createMarketWithShadowPortfolio: signFundingTx must return a non-empty ' +
+          'Solana tx signature string.',
+      });
+    }
+    return this.finalizeCreateMarket({
+      agentPubkey: prep.agentPubkey,
+      fundingSignature,
+    });
+  }
+
+  /**
    * Register an externally-created market with the API.
    *
    * Workflow: you created the market on chain yourself, and you hold
