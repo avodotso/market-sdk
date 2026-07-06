@@ -272,8 +272,16 @@ export interface NavResp {
 export interface WeightInput {
   /** `'base'` or a base58 MarketAsset mint. */
   asset: string;
-  /** Percent (0–100). Decimals allowed; coerced to bps via `round(weight×100)`. */
-  weight: number;
+  /** Percent (0–100). Decimals allowed; coerced to bps via `round(weight×100)`.
+   *  Per-entry rounding introduces sum drift for fractional percents — for
+   *  full 1-bps precision without drift, use `weightBps` instead. Either
+   *  `weight` or `weightBps` MUST be present. */
+  weight?: number;
+  /** Basis points (0..10_000). Native on-chain unit. When present, `weight`
+   *  is ignored, no conversion runs, and sums to 10_000 hold exactly.
+   *  Prefer this for equal-weight indices (N≥5) and any allocation whose
+   *  natural expression is sub-percent. */
+  weightBps?: number;
 }
 
 export interface RebalanceBody {
