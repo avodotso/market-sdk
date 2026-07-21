@@ -284,6 +284,24 @@ export interface WeightInput {
   weightBps?: number;
 }
 
+/** POST /v1/agent/fees/withdraw — pull-out for the agent's fee ATA. */
+export interface WithdrawAgentFeesBody {
+  destinationWallet: string;
+  /** Atomic units. Skip transfer if balance <= this. Default 0. */
+  minFeeAmount?: string | bigint;
+}
+
+export interface WithdrawAgentFeesResp {
+  /** Null when the endpoint no-oped (balance ≤ `minFeeAmount`). */
+  signature: string | null;
+  /** Amount transferred in atomic units of `feeAssetMint`. */
+  amountWithdrawn: string;
+  /** Post-transfer balance still in the agent fee ATA. */
+  remainingBalance: string;
+  feeAssetMint: string;
+  destinationAta: string;
+}
+
 export interface RebalanceBody {
   weights: WeightInput[];
   slippageBps?: number;
