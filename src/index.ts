@@ -85,6 +85,8 @@ export type {
   AddAssetResp,
   RemoveAssetOpts,
   RemoveAssetResp,
+  WithdrawAgentFeesBody,
+  WithdrawAgentFeesResp,
   QuoteParams,
   QuoteResp,
   // Identity

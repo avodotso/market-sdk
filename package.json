@@ -1,6 +1,6 @@
 {
   "name": "@avodotso/market-sdk",
-  "version": "0.1.5",
+  "version": "0.2.0",
   "description": "TypeScript client for the Avo Portfolio API. Bootstrap a market-maker agent, run rebalances, push NAV updates — custodial or self-custodial.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

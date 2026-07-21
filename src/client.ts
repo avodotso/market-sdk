@@ -66,6 +66,8 @@ import type {
   SimulateBody,
   SimulateResp,
   ValueResp,
+  WithdrawAgentFeesBody,
+  WithdrawAgentFeesResp,
 } from './types';
 
 const ATTACH_AUDIENCE = 'avo-portfolio-api/8004-attach/v1';
@@ -414,6 +416,23 @@ export class MarketClient extends HttpBase {
   /** Register a new MarketAsset (at 0% target weight). */
   addAsset(body: AddAssetBody): Promise<AddAssetResp> {
     return this.callAvo('POST', '/v1/assets', { body });
+  }
+
+  /**
+   * Pull the accrued fees out of the market agent's fee ATA and land
+   * them in a destination wallet. Same on-chain effect a manual SPL
+   * `transfer` from the agent would produce — but the agent signs
+   * server-side so operators never need to hold the agent's keys just
+   * to reclaim fees.
+   *
+   * Idempotent — safe to call on a cron. Returns `signature: null` +
+   * `amountWithdrawn: "0"` when the balance is already below
+   * `minFeeAmount` (typically set to skip dust).
+   */
+  withdrawAgentFees(body: WithdrawAgentFeesBody): Promise<WithdrawAgentFeesResp> {
+    return this.callAvo('POST', '/v1/agent/fees/withdraw', {
+      body: this.serializeBody(body),
+    });
   }
 
   /**
