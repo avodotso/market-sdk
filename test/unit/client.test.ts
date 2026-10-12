@@ -564,3 +564,88 @@ describe('MarketClient — error handling', () => {
     }
   });
 });
+
+describe('MarketClient — current service compatibility', () => {
+  it('rejects HTTP 200 rebalance failures after keepalive whitespace without retrying', async () => {
+    const error = { status: 504, code: 'REBALANCE_TIMEOUT', message: 'Partially applied',
+      details: { marketPda: 'market' } };
+    const { fn, requests } = captureFetch(() => new Response(
+      `  \n ${JSON.stringify({ __rebalanceError: error })}`, { status: 200 },
+    ));
+    const client = new MarketClient({ services: { avoApi: AVO_API }, fetch: fn,
+      agent: { bearer: 'agent-token' } });
+    await expect(client.rebalance({ weights: [{ asset: 'base', weightBps: 10000 }] }))
+      .rejects.toMatchObject(error);
+    expect(requests).toHaveLength(1);
+  });
+
+  it('keeps successful streamed results including drift-only completion', async () => {
+    const result = { prepareSignature: '', settleSignature: '', legs: [],
+      totalValueBeforeBase: '100', newBaseTargetWeightBps: 10000, driftAutoSuccess: true };
+    const { fn } = captureFetch(() => new Response(`  ${JSON.stringify(result)}`));
+    const client = new MarketClient({ services: { avoApi: AVO_API }, fetch: fn,
+      agent: { bearer: 'agent-token' } });
+    expect(await client.rebalance({ weights: [{ asset: 'base', weightBps: 10000 }] }))
+      .toEqual(result);
+  });
+
+  it('separates refreshing gateway auth from agent auth and omits agent auth on public reads', async () => {
+    const { fn, requests } = captureFetch(() => jsonResponse({}));
+    let counter = 0;
+    const client = new MarketClient({ services: { avoApi: AVO_API }, fetch: fn,
+      gatewayAuthorization: async () => `Bearer gateway-${++counter}`,
+      agent: { bearer: 'agent-token' } });
+    await client.getMarket();
+    await client.simulateRebalance({ weights: [{ asset: 'base', weightBps: 10000 }],
+      dustThresholdBps: 0, dustThresholdBase: 0n });
+    await client.listMarkets();
+    expect(requests.map(r => r.headers.authorization)).toEqual([
+      'Bearer gateway-1', 'Bearer gateway-2', 'Bearer gateway-3',
+    ]);
+    expect(requests.map(r => r.headers['x-avo-agent-authorization'])).toEqual([
+      'Bearer agent-token', 'Bearer agent-token', undefined,
+    ]);
+    expect(requests[1].body).toMatchObject({ dustThresholdBps: 0, dustThresholdBase: '0' });
+    expect(requests[1].url).toBe(`${AVO_API}/v1/rebalance/simulate`);
+  });
+
+  it('fails before any request when the gateway credential is empty', async () => {
+    const { fn, requests } = captureFetch(() => jsonResponse({}));
+    const client = new MarketClient({ services: { avoApi: AVO_API }, fetch: fn,
+      gatewayAuthorization: ' ', agent: { bearer: 'agent-token' } });
+    await expect(client.getMarket()).rejects.toMatchObject({ code: 'GATEWAY_AUTH_EMPTY' });
+    expect(requests).toHaveLength(0);
+  });
+
+  it('relays Sig auth through the gateway without replacing its credential', async () => {
+    const agent = makeAgent();
+    const { fn, requests } = captureFetch(() => jsonResponse({}));
+    const client = new MarketClient({ services: { avoApi: AVO_API }, fetch: fn,
+      gatewayAuthorization: 'Bearer gateway', agent });
+    await client.getQuote({ from: 'A', to: 'B', amount: 1n, onlyDirectRoutes: false });
+    expect(requests[0].headers.authorization).toBe('Bearer gateway');
+    expect(requests[0].headers['x-avo-agent-authorization']).toMatch(/^Sig /);
+    expect(new URL(requests[0].url).searchParams.get('onlyDirectRoutes')).toBe('false');
+  });
+
+  it('forwards fee, dust, routing and progress controls without changing them', async () => {
+    const { fn, requests } = captureFetch(() => jsonResponse({ legs: [] }));
+    const client = new MarketClient({ services: { avoApi: AVO_API }, fetch: fn,
+      agent: { bearer: 'agent-token' } });
+    const body = { weights: [{ asset: 'base', weightBps: 10000 }], slippageBps: 200,
+      feeSlippageBps: 200, dustThresholdBps: 0, acceptLowAumTopup: false,
+      progressId: 'test', onlyDirectRoutes: false, excludeDexes: 'Scorch' };
+    await client.rebalance(body);
+    expect(requests[0].body).toEqual(body);
+  });
+
+  it('preserves unroutable simulation legs even on a successful HTTP response', async () => {
+    const result = { legs: [{ mint: 'A', direction: 'sell', unroutable: true,
+      unroutableReason: 'No route', expectedOut: '0' }] };
+    const { fn } = captureFetch(() => jsonResponse(result));
+    const client = new MarketClient({ services: { avoApi: AVO_API }, fetch: fn,
+      agent: { bearer: 'agent-token' } });
+    expect(await client.simulateRebalance({ weights: [{ asset: 'base', weightBps: 10000 }] }))
+      .toEqual(result);
+  });
+});

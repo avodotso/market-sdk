@@ -305,7 +305,16 @@ export interface WithdrawAgentFeesResp {
 export interface RebalanceBody {
   weights: WeightInput[];
   slippageBps?: number;
+  /** Fee conversion tolerance; independent of the main swap slippage. */
+  feeSlippageBps?: number;
   deadlineSecs?: number;
+  /** Per-leg dust threshold as bps of live NAV; default is server/market-specific.
+   *  An explicit dustThresholdBase takes precedence. */
+  dustThresholdBps?: number;
+  /** Consent to the server's low-AUM referrer-fee override. */
+  acceptLowAumTopup?: boolean;
+  /** Correlation ID for server-side progress events. */
+  progressId?: string;
   /** Per-leg dust threshold in atomic base units. Below this, the leg
    *  becomes a pure weight rewrite — no swap, no fee. */
   dustThresholdBase?: string | bigint;
@@ -327,7 +336,7 @@ export interface RebalanceLegResult {
   mint: string;
   direction: 'buy' | 'sell' | 'none';
   /** Router that executed the swap (or `'none'` for weight-only legs). */
-  router: 'dflow' | 'jupiter' | 'none';
+  router: 'dflow' | 'jupiter' | 'titan' | 'none';
   /** Tx signature for this leg's `rebalance_leg` call. Absent on `none`-
    *  router legs. */
   signature?: string;
@@ -336,7 +345,7 @@ export interface RebalanceLegResult {
   minOut: string;
   feeAssetExpectedOut: string | null;
   attempts: Array<{
-    router: 'dflow' | 'jupiter';
+    router: 'dflow' | 'jupiter' | 'titan';
     ok: boolean;
     reason?: string;
   }>;
@@ -354,15 +363,29 @@ export interface RebalanceResp {
   totalValueBeforeBase: string;
   newBaseTargetWeightBps: number;
   legs: RebalanceLegResult[];
+  /** The server accepted the existing composition after checking drift.
+   *  Signatures can be empty when no transaction was needed. */
+  driftAutoSuccess?: boolean;
+  driftInfo?: {
+    withinTolerance: boolean;
+    maxAbsDriftBps: number;
+    toleranceBps: number;
+    perAsset: Array<{ mint: string; targetBps: number; currentBps: number; driftBps: number }>;
+    suppressedError?: { code: string; message: string };
+  };
 }
 
 export interface SimulateBody {
   weights: WeightInput[];
   slippageBps?: number;
   dustThresholdBase?: string | bigint;
+  dustThresholdBps?: number;
 }
 
 export interface SimulatedLeg {
+  /** True when no usable quote was found. Optional for older services. */
+  unroutable?: boolean;
+  unroutableReason?: string | null;
   mint: string;
   direction: 'buy' | 'sell' | 'none';
   amountIn: string;

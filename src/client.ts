@@ -103,6 +103,10 @@ export interface MarketClientAgent {
 }
 
 export interface MarketClientConfig extends HttpBaseConfig {
+  /** When using the API gateway, provide its Authorization header separately
+   *  from agent auth. A callback can refresh an expiring gateway credential.
+   *  Agent auth is then sent as `x-avo-agent-authorization`. */
+  gatewayAuthorization?: string | (() => string | Promise<string>);
   /** Agent identity for authenticated methods. Omit when the client is
    *  used only for bootstrap (`prepareCreateMarket` / `registerMarket`)
    *  or public reads (`listMarkets`, `healthz`, `getIdentity`). */
@@ -129,9 +133,11 @@ export class MarketClient extends HttpBase {
   private readonly knownAgentPubkey: string | null;
   private readonly tokenTtlSecs: number;
   private cached: CachedToken | null = null;
+  private readonly gatewayAuthorization: MarketClientConfig['gatewayAuthorization'];
 
   constructor(cfg: MarketClientConfig = {}) {
     super(cfg);
+    this.gatewayAuthorization = cfg.gatewayAuthorization;
     const a = cfg.agent;
     if (a) {
       const hasSigner = !!(a.secretKey || a.signer);
@@ -395,7 +401,8 @@ export class MarketClient extends HttpBase {
     });
   }
 
-  /** Push a fresh total-value into `Market.last_total_value`. */
+  /** Push a fresh total-value into `Market.last_total_value`.
+   *  Signs and submits server-side; this is NOT a read-only valuation call. */
   updateNav(body: NavBody = {}): Promise<NavResp> {
     return this.callAvo('POST', '/v1/nav', { body: this.serializeBody(body) });
   }
@@ -404,11 +411,21 @@ export class MarketClient extends HttpBase {
    * Drive a full rebalance (prepare → leg × N → settle). The API picks
    * routers, signs every tx as the agent, and submits.
    */
-  rebalance(body: RebalanceBody): Promise<RebalanceResp> {
-    return this.callAvo('POST', '/v1/rebalance', { body: this.serializeBody(body) });
+  async rebalance(body: RebalanceBody): Promise<RebalanceResp> {
+    // Keepalive whitespace commits HTTP 200 before execution finishes. A late
+    // failure is therefore carried in the JSON body, not the HTTP status.
+    const result = await this.callAvo<RebalanceResp | {
+      __rebalanceError: { status: number; code: string; message: string; details?: unknown };
+    }>('POST', '/v1/rebalance', { body: this.serializeBody(body) });
+    if ('__rebalanceError' in result) {
+      throw new AvoSdkError(result.__rebalanceError);
+    }
+    return result;
   }
 
-  /** Dry-run version of `rebalance` — same planning, no submission. */
+  /** Read-only planning and Jupiter quotes. Does not build or simulate on-chain
+   *  transactions, validate settlement, or exercise rebalance router filters.
+   *  Inspect each leg's `unroutable` flag before proceeding. */
   simulateRebalance(body: SimulateBody): Promise<SimulateResp> {
     return this.callAvo('POST', '/v1/rebalance/simulate', { body: this.serializeBody(body) });
   }
@@ -510,8 +527,19 @@ export class MarketClient extends HttpBase {
     } = {},
   ): Promise<T> {
     const headers: Record<string, string> = {};
+    if (this.gatewayAuthorization !== undefined) {
+      const authorization = typeof this.gatewayAuthorization === 'function'
+        ? await this.gatewayAuthorization()
+        : this.gatewayAuthorization;
+      if (!authorization.trim()) {
+        throw new AvoSdkError({ status: 500, code: 'GATEWAY_AUTH_EMPTY',
+          message: 'gatewayAuthorization must return a non-empty Authorization header.' });
+      }
+      headers.authorization = authorization;
+    }
     if (opts.auth !== false) {
-      headers['authorization'] = await this.getAuthorizationHeader();
+      headers[this.gatewayAuthorization !== undefined
+        ? 'x-avo-agent-authorization' : 'authorization'] = await this.getAuthorizationHeader();
     }
     return this.requestService<T>({
       baseUrl: this.services.avoApi,
