@@ -309,3 +309,64 @@ Semver. Anything documented above is stable.
 ## License
 
 ISC. See `LICENSE`.
+
+
+## Service compatibility (0.2.1)
+
+Pin `@avodotso/market-sdk` to **`0.2.1`** in worker dependencies and regenerate
+locks after that version is published. Do not use `latest` for scheduled workers.
+This package publishes to public npm; `@avodotso/portfolio-internal` is a separate
+service-side package with program-deployment constraints.
+
+For a gateway URL, supply the gateway's full Authorization header independently
+of the market agent credential:
+
+```ts
+const client = new MarketClient({
+  services: { avoApi: 'https://dev-avo-fe-api.up.railway.app' },
+  gatewayAuthorization: async () => getGatewayAuthorization(),
+  agent: { bearer: agentBearer },
+});
+```
+
+`getGatewayAuthorization` is your credential provider (returning, for example,
+`Bearer <gateway token>`). The SDK sends it in `Authorization` and sends agent
+auth in `x-avo-agent-authorization`. The callback runs per request so expiring
+credentials can refresh. Public reads omit agent auth. Direct market-service
+clients omit `gatewayAuthorization` and retain the existing header behavior.
+Never log either credential. The old standalone
+`portfolio-contract-api-service-dev.up.railway.app` URL is no longer a working
+service endpoint.
+
+`rebalance()` invokes the server's prepare → swap legs → settle orchestration;
+the service builds, signs and submits transactions. Sig authentication proves
+API identity; it does not turn this endpoint into an unsigned transaction
+builder. There are no separate build, sign, submit or settle methods in this
+HTTP SDK. `updateNav()` also signs and submits on the server.
+
+For read-only validation use `getQuote()`, `getValue()` and
+`simulateRebalance()`. The last method plans and quotes; it does **not** run
+Solana transaction simulation or validate settlement. Reject unroutable legs
+(`unroutable`, `unroutableReason`) and independently check execution loss.
+`estimatedTotalValueAfterBase` deducts estimated fees; it is not proof of a
+maximum market-impact loss. Slippage of 200 bps alone does not prove a 2% loss
+limit against a reference value.
+
+Keep `onlyDirectRoutes` false or omitted for assets requiring multiple hops.
+Rebalance accepts `excludeDexes` (for example `Scorch`), `feeSlippageBps`,
+`dustThresholdBps`, `acceptLowAumTopup` and `progressId`. The simulation endpoint
+accepts dust thresholds but does not exercise the rebalance router filters or
+fee-conversion swaps. Router-filter serialization is not proof of enforcement:
+market-service deployment `541e307e` accepts these fields but does not forward
+them from its execution service to the orchestrator. Its dFlow adapter already statically excludes Scorch, but workers must verify
+that protection in route evidence; arbitrary caller filters need backend
+forwarding before they can be relied upon.
+`dustThresholdBase` takes precedence over bps. Server dust
+defaults vary by market; pass an explicit value when comparing preview and run.
+
+A failed rebalance may arrive as HTTP 200 after keepalive whitespace, containing
+`__rebalanceError`. Version 0.2.1 throws `AvoSdkError` with its status, code,
+message and details. There is no automatic retry: execution may already be
+partially applied. Inspect the market/plan before retrying. Successful
+`driftAutoSuccess` responses can have empty signatures when existing weights
+are already acceptable; they do not mean new transactions landed.
