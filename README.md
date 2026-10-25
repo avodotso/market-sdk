@@ -72,7 +72,7 @@ External signers (KMS / hardware wallet / Turnkey) are supported via `agent.sign
 The API generates a fresh agent keypair custodially. You sign the funding tx with your operator wallet; the API does the rest. You get back a one-time bearer for ongoing ops.
 
 ```ts
-import { MarketClient } from '@avodotso/market-sdk';
+import { MarketClient, buildCreatorAuth } from '@avodotso/market-sdk';
 import { VersionedTransaction } from '@solana/web3.js';
 
 const client = new MarketClient({ services: { avoApi: 'https://portfolio-contract-api-service-dev.up.railway.app' } });
@@ -92,11 +92,23 @@ const prep = await client.prepareCreateMarket({
 const tx = VersionedTransaction.deserialize(Buffer.from(prep.fundingTx, 'base64'));
 const fundingSig = await myWallet.signAndSendTransaction(tx);
 
-// Phase 2: API verifies funding, custodial agent signs `create_market`
+// Phase 2: the same wallet signs a short-lived, single-use creatorAuth that
+// binds this pending market, its agent and the funding tx. Finalize is
+// refused without it.
+const { creatorAuth } = await buildCreatorAuth({
+  creator: myWallet.publicKey.toBase58(),
+  pendingId: prep.pendingId,
+  agentPubkey: prep.agentPubkey,
+  fundingSignature: fundingSig,
+  signMessage: (msg) => myWallet.signMessage(msg), // or `secretKey: creatorKp.secretKey`
+});
+
+// API verifies creatorAuth + funding, custodial agent signs `create_market`
 // on chain, weight-set rebalance lands the initial weights atomically.
 const result = await client.finalizeCreateMarket({
   agentPubkey: prep.agentPubkey,
   fundingSignature: fundingSig,
+  creatorAuth,
 });
 
 console.log({
@@ -105,6 +117,22 @@ console.log({
   bearer: result.bearer, // STORE NOW — shown ONCE
 });
 ```
+
+`creatorAuth` is valid for at most 110 seconds (default 60) and its nonce is single-use, so build a new one for every finalize attempt, including retries after a retryable `FUNDING_TX_NOT_FOUND` (honour `Retry-After`). Errors: `CREATOR_AUTH_REQUIRED`, `CREATOR_MISMATCH`, `CREATOR_AUTH_REPLAYED`, `FUNDING_*`.
+
+One call does all of the above:
+
+```ts
+const result = await client.createMarketWithShadowPortfolio(
+  body,
+  async (fundingTxBase64) => myWallet.signAndSendTransaction(
+    VersionedTransaction.deserialize(Buffer.from(fundingTxBase64, 'base64')),
+  ),
+  (msg) => myWallet.signMessage(msg),
+);
+```
+
+**Upgrading from 0.2.x:** `finalizeCreateMarket` now requires `creatorAuth`, and `createMarketWithShadowPortfolio` takes a required third `signMessage` argument. Both must be signed by `body.creator`.
 
 ### Register a market you built on-chain yourself
 
@@ -130,7 +158,8 @@ const result = await client.registerMarket({
 | Method | Endpoint | Notes |
 |---|---|---|
 | `prepareCreateMarket(body)` | `POST /v1/markets/create/prepare` | Returns an unsigned funding tx. |
-| `finalizeCreateMarket(body)` | `POST /v1/markets/create/finalize` | Returns marketPda + one-time bearer. |
+| `finalizeCreateMarket(body)` | `POST /v1/markets/create/finalize` | Requires `creatorAuth` from `buildCreatorAuth`. Returns marketPda + one-time bearer. |
+| `createMarketWithShadowPortfolio(body, signFundingTx, signMessage)` | prepare → fund → finalize | One-shot create; both callbacks use the `body.creator` wallet. |
 | `registerMarket(body)` | `POST /v1/markets/register` | For markets you created on chain yourself. |
 
 ### Public reads (no auth)

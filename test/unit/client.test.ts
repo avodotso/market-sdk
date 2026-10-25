@@ -119,6 +119,7 @@ describe('MarketClient — bootstrap endpoints (no auth)', () => {
   it('POSTs /v1/markets/create/prepare with the body verbatim', async () => {
     const { fn, requests } = captureFetch(() =>
       jsonResponse({
+        pendingId: 'pending_1',
         agentPubkey: 'GbGgT4qSpooM6f1cgFD3Q63oZcMpkkE4dZgEjs83JM7M',
         fundingLamports: 100_000_000,
         fundingTx: 'b64-encoded-tx',

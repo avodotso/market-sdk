@@ -34,6 +34,7 @@ import bs58 from 'bs58';
 import { HttpBase, type HttpBaseConfig } from './http-base';
 import { mintAuthToken, type SignerInput, type SignerFn } from './auth';
 import { AvoSdkError } from './errors';
+import { buildCreatorAuth } from './finalize-auth';
 import type {
   AddAssetBody,
   AddAssetResp,
@@ -215,8 +216,9 @@ export class MarketClient extends HttpBase {
   }
 
   /**
-   * Phase 2 of permissionless market creation. Verifies the funding
-   * transfer landed, then the custodial agent signs `create_market` +
+   * Phase 2 of permissionless market creation. Requires `creatorAuth`
+   * from `buildCreatorAuth`, signed by the creator wallet. Verifies it and
+   * the funding transfer, then the custodial agent signs `create_market` +
    * one `add_market_asset` per requested asset SERVER-SIDE. Returns the
    * marketPda + a one-time bearer.
    */
@@ -235,25 +237,50 @@ export class MarketClient extends HttpBase {
    * tab populate without any additional client calls. **Everything
    * needed to get the chart working is set up by this single method.**
    *
-   * The caller supplies a `signFundingTx` callback that takes the
-   * base64-encoded unsigned `VersionedTransaction` from phase 1, signs
-   * + submits it via the operator's wallet, and returns the Solana
-   * signature. This SDK never touches the operator's signing material.
+   * The caller supplies two callbacks backed by the `body.creator` wallet:
+   * `signFundingTx` takes the base64-encoded unsigned `VersionedTransaction`
+   * from phase 1, signs + submits it, and returns the Solana signature;
+   * `signMessage` signs the finalize `creatorAuth` message (a wallet
+   * `signMessage`, returning the 64-byte Ed25519 signature). This SDK never
+   * touches the operator's signing material.
    *
    * Example with Dynamic's Solana adapter:
    * ```ts
-   * await client.createMarketWithShadowPortfolio(body, async (txBase64) => {
-   *   const tx = VersionedTransaction.deserialize(Buffer.from(txBase64, 'base64'));
-   *   const result = await primaryWallet.signAndSendTransaction(tx);
-   *   return typeof result === 'string' ? result : result.signature;
-   * });
+   * await client.createMarketWithShadowPortfolio(
+   *   body,
+   *   async (txBase64) => {
+   *     const tx = VersionedTransaction.deserialize(Buffer.from(txBase64, 'base64'));
+   *     const result = await primaryWallet.signAndSendTransaction(tx);
+   *     return typeof result === 'string' ? result : result.signature;
+   *   },
+   *   (msg) => primaryWallet.signMessage(msg),
+   * );
    * ```
    */
   async createMarketWithShadowPortfolio(
     body: PrepareCreateMarketBody,
     signFundingTx: (fundingTxBase64: string) => Promise<string>,
+    signMessage: (message: Uint8Array) => Promise<Uint8Array>,
   ): Promise<FinalizeCreateMarketResp> {
+    if (typeof signMessage !== 'function') {
+      throw new AvoSdkError({
+        status: 400,
+        code: 'SIGN_MESSAGE_REQUIRED',
+        message:
+          'createMarketWithShadowPortfolio: signMessage is required to sign the ' +
+          'finalize creatorAuth with the creator wallet.',
+      });
+    }
     const prep = await this.prepareCreateMarket(body);
+    if (!prep.pendingId || typeof prep.pendingId !== 'string') {
+      throw new AvoSdkError({
+        status: 502,
+        code: 'PENDING_ID_MISSING',
+        message:
+          'createMarketWithShadowPortfolio: prepare response has no pendingId; ' +
+          'the API is too old for creator-bound finalize.',
+      });
+    }
     const fundingSignature = await signFundingTx(prep.fundingTx);
     if (!fundingSignature || typeof fundingSignature !== 'string') {
       throw new AvoSdkError({
@@ -264,9 +291,17 @@ export class MarketClient extends HttpBase {
           'Solana tx signature string.',
       });
     }
+    const { creatorAuth } = await buildCreatorAuth({
+      creator: body.creator,
+      pendingId: prep.pendingId,
+      agentPubkey: prep.agentPubkey,
+      fundingSignature,
+      signMessage,
+    });
     return this.finalizeCreateMarket({
       agentPubkey: prep.agentPubkey,
       fundingSignature,
+      creatorAuth,
     });
   }
 

@@ -43,6 +43,8 @@ export interface PrepareCreateMarketBody {
 }
 
 export interface PrepareCreateMarketResp {
+  /** `PendingMarket.id`. Signed into `creatorAuth` at finalize. */
+  pendingId: string;
   agentPubkey: string;
   fundingLamports: number;
   /** Base64-encoded unsigned `VersionedTransaction`. Creator signs +
@@ -55,6 +57,9 @@ export interface FinalizeCreateMarketBody {
   agentPubkey: string;
   /** Signature of the funding transfer. */
   fundingSignature: string;
+  /** Creator-signed binding from `buildCreatorAuth`. Single-use and valid
+   *  for at most 110s, so build a fresh one for every finalize attempt. */
+  creatorAuth: string;
 }
 
 export interface FinalizeCreateMarketResp {
