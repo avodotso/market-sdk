@@ -118,7 +118,7 @@ console.log({
 });
 ```
 
-`creatorAuth` is valid for at most 110 seconds (default 60) and its nonce is single-use, so build a new one for every finalize attempt, including retries after a retryable `FUNDING_TX_NOT_FOUND` (honour `Retry-After`). Errors: `CREATOR_AUTH_REQUIRED`, `CREATOR_MISMATCH`, `CREATOR_AUTH_REPLAYED`, `FUNDING_*`.
+`creatorAuth` is valid for at most 110 seconds (default 60) and its nonce is single-use, so build a new one for every finalize attempt. If the funding tx isn't confirmed yet, finalize returns `FUNDING_TX_NOT_FOUND` (or `FUNDING_TX_LOOKUP_FAILED`); wait `err.retryAfterMs` and retry with a fresh `creatorAuth`. Other refusals: `CREATOR_AUTH_REQUIRED`, `CREATOR_AUTH_EXPIRED`, `CREATOR_AUTH_INVALID`, `CREATOR_MISMATCH`, `CREATOR_AUTH_REPLAYED`, `BAD_FUNDING_SIGNATURE` and the other `FUNDING_*` codes. `expiresAtMs` comes from your local clock and the API refuses values more than 120 s ahead, so a clock running fast by more than 120 s minus the TTL gets `CREATOR_AUTH_EXPIRED`.
 
 One call does all of the above:
 
@@ -131,6 +131,8 @@ const result = await client.createMarketWithShadowPortfolio(
   (msg) => myWallet.signMessage(msg),
 );
 ```
+
+The helper retries `FUNDING_TX_NOT_FOUND` / `FUNDING_TX_LOOKUP_FAILED` (up to 4 attempts by default, `{ maxFinalizeAttempts }` as a fourth argument), calling `signMessage` once per attempt. Any error it throws after funding carries `details.pendingId`, `details.agentPubkey` and `details.fundingSignature`, so you can finish with `buildCreatorAuth` + `finalizeCreateMarket`.
 
 **Upgrading from 0.2.x:** `finalizeCreateMarket` now requires `creatorAuth`, and `createMarketWithShadowPortfolio` takes a required third `signMessage` argument. Both must be signed by `body.creator`.
 

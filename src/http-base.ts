@@ -97,6 +97,7 @@ export class HttpBase {
           envelope?.message ??
           `avo-api returned ${res.status} ${res.statusText} for ${opts.method} ${opts.path}`,
         details: envelope?.details,
+        retryAfterMs: parseRetryAfter(res.headers?.get?.('retry-after') ?? null),
       });
     }
 
@@ -129,4 +130,12 @@ function buildUrl(
   }
   const s = qs.toString();
   return s ? `${base}${p}?${s}` : `${base}${p}`;
+}
+
+function parseRetryAfter(value: string | null): number | undefined {
+  if (!value) return undefined;
+  const trimmed = value.trim();
+  if (/^\d+$/.test(trimmed)) return Number(trimmed) * 1000;
+  const at = Date.parse(trimmed);
+  return Number.isNaN(at) ? undefined : Math.max(0, at - Date.now());
 }

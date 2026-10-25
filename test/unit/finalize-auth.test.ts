@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { describe, it, expect } from 'vitest';
 import nacl from 'tweetnacl';
 import bs58 from 'bs58';
@@ -45,6 +46,10 @@ describe('finalize creator auth — golden vector', () => {
   it('builds the exact message bytes', () => {
     const msg = finalizeAuthMessage(msgArgs);
     expect(hex(msg)).toBe(GOLDEN_MESSAGE_HEX);
+    expect(msg.length).toBe(266);
+    expect(createHash('sha256').update(msg).digest('hex')).toBe(
+      '57e5d11882d6bd26915ec609ae67e11b05302e5517b5e3279a0b2e34b09683d2',
+    );
     expect(new TextDecoder().decode(msg)).toBe(
       `${FINALIZE_AUTH_AUDIENCE}\n${CREATOR}\n${PENDING_ID}\n${AGENT}\n${FUNDING_SIG}\n${EXPIRES_AT_MS}\n${NONCE}`,
     );
@@ -198,16 +203,29 @@ describe('MarketClient.createMarketWithShadowPortfolio', () => {
     marketFeeBps: 30,
   };
 
-  function fakeApi(prepResp: Record<string, unknown>) {
+  type Reply = { status: number; body: unknown; headers?: Record<string, string> };
+  function fakeApi(prepResp: Record<string, unknown>, finalizeReplies: Reply[] = []) {
     const calls: { url: string; body: any }[] = [];
     const fn: typeof fetch = async (input, init) => {
       const url = String(input);
       calls.push({ url, body: init?.body ? JSON.parse(init.body as string) : undefined });
-      const body = url.endsWith('/prepare') ? prepResp : { marketPda: 'M', bearer: 'mb_x' };
-      return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
+      const reply: Reply = url.endsWith('/prepare')
+        ? { status: 200, body: prepResp }
+        : finalizeReplies.shift() ?? { status: 200, body: { marketPda: 'M', bearer: 'mb_x' } };
+      return new Response(JSON.stringify(reply.body), {
+        status: reply.status,
+        headers: { 'content-type': 'application/json', ...(reply.headers ?? {}) },
+      });
     };
     return { fn, calls };
   }
+  const prepOk = { pendingId: PENDING_ID, agentPubkey: AGENT, fundingTx: 'tx64', fundingLamports: 1, nextStep: '' };
+  const signCreator = async (m: Uint8Array) => nacl.sign.detached(m, creatorKp.secretKey);
+  const notFound: Reply = {
+    status: 409,
+    body: { error: { code: 'FUNDING_TX_NOT_FOUND', message: 'not yet' } },
+    headers: { 'retry-after': '2' },
+  };
 
   it('signs creatorAuth over pendingId, agent and funding sig, then finalizes', async () => {
     const { fn, calls } = fakeApi({ pendingId: PENDING_ID, agentPubkey: AGENT, fundingTx: 'tx64', fundingLamports: 1, nextStep: '' });
@@ -285,5 +303,105 @@ describe('MarketClient.createMarketWithShadowPortfolio', () => {
       ),
     ).rejects.toThrow(/does not verify/);
     expect(calls).toHaveLength(1);
+  });
+
+  it('retries FUNDING_TX_NOT_FOUND with a fresh creatorAuth, honouring Retry-After', async () => {
+    const { fn, calls } = fakeApi(prepOk, [notFound, notFound]);
+    const client = new MarketClient({ services: { avoApi: 'https://avo-api.test' }, fetch: fn });
+    const slept: number[] = [];
+    let signs = 0;
+    const out = await client.createMarketWithShadowPortfolio(
+      prepBody,
+      async () => FUNDING_SIG,
+      async (m) => {
+        signs++;
+        return signCreator(m);
+      },
+      { sleep: async (ms) => void slept.push(ms) },
+    );
+    expect(out.bearer).toBe('mb_x');
+    expect(signs).toBe(3);
+    expect(slept).toEqual([2000, 2000]);
+    const auths = calls.slice(1).map((c) => c.body.creatorAuth);
+    expect(new Set(auths.map((a: string) => a.split('.')[2])).size).toBe(3);
+  });
+
+  it('gives up after maxFinalizeAttempts with recovery details and retryAfterMs', async () => {
+    const { fn, calls } = fakeApi(prepOk, [notFound, notFound, notFound]);
+    const client = new MarketClient({ services: { avoApi: 'https://avo-api.test' }, fetch: fn });
+    const err = await client
+      .createMarketWithShadowPortfolio(prepBody, async () => FUNDING_SIG, signCreator, {
+        maxFinalizeAttempts: 2,
+        sleep: async () => {},
+      })
+      .catch((e) => e);
+    expect(calls).toHaveLength(3);
+    expect(err).toMatchObject({
+      code: 'FUNDING_TX_NOT_FOUND',
+      status: 409,
+      retryAfterMs: 2000,
+      details: { pendingId: PENDING_ID, agentPubkey: AGENT, fundingSignature: FUNDING_SIG },
+    });
+  });
+
+  it('does not retry non-retryable refusals and keeps the server code', async () => {
+    const { fn, calls } = fakeApi(prepOk, [
+      { status: 403, body: { error: { code: 'CREATOR_MISMATCH', message: 'no', details: { x: 1 } } } },
+    ]);
+    const client = new MarketClient({ services: { avoApi: 'https://avo-api.test' }, fetch: fn });
+    await expect(
+      client.createMarketWithShadowPortfolio(prepBody, async () => FUNDING_SIG, signCreator, { sleep: async () => {} }),
+    ).rejects.toMatchObject({
+      code: 'CREATOR_MISMATCH',
+      status: 403,
+      details: { pendingId: PENDING_ID, agentPubkey: AGENT, fundingSignature: FUNDING_SIG, upstream: { x: 1 } },
+    });
+    expect(calls).toHaveLength(2);
+  });
+
+  it('wraps a refused wallet signature after funding with recovery details', async () => {
+    const { fn, calls } = fakeApi(prepOk);
+    const client = new MarketClient({ services: { avoApi: 'https://avo-api.test' }, fetch: fn });
+    await expect(
+      client.createMarketWithShadowPortfolio(prepBody, async () => FUNDING_SIG, async () => {
+        throw new Error('User rejected the request');
+      }),
+    ).rejects.toMatchObject({
+      code: 'CREATOR_AUTH_SIGN_FAILED',
+      details: { pendingId: PENDING_ID, agentPubkey: AGENT, fundingSignature: FUNDING_SIG },
+    });
+    expect(calls).toHaveLength(1);
+  });
+
+  it('wraps a transport failure during finalize with recovery details', async () => {
+    let n = 0;
+    const fn: typeof fetch = async () => {
+      if (n++ === 0) {
+        return new Response(JSON.stringify(prepOk), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      throw new Error('socket hang up');
+    };
+    const client = new MarketClient({ services: { avoApi: 'https://avo-api.test' }, fetch: fn });
+    await expect(
+      client.createMarketWithShadowPortfolio(prepBody, async () => FUNDING_SIG, signCreator),
+    ).rejects.toMatchObject({
+      code: 'FINALIZE_INCOMPLETE',
+      details: { pendingId: PENDING_ID, agentPubkey: AGENT, fundingSignature: FUNDING_SIG },
+    });
+  });
+});
+
+describe('AvoSdkError.retryAfterMs', () => {
+  it('parses Retry-After seconds and is absent without the header', async () => {
+    const replies = [
+      new Response(JSON.stringify({ error: { code: 'X', message: 'm' } }), { status: 409, headers: { 'retry-after': '3' } }),
+      new Response(JSON.stringify({ error: { code: 'Y', message: 'm' } }), { status: 409 }),
+    ];
+    const client = new MarketClient({ services: { avoApi: 'https://avo-api.test' }, fetch: async () => replies.shift()! });
+    const a = await client.finalizeCreateMarket({ agentPubkey: AGENT, fundingSignature: FUNDING_SIG, creatorAuth: GOLDEN_CREATOR_AUTH }).catch((e) => e);
+    const b = await client.finalizeCreateMarket({ agentPubkey: AGENT, fundingSignature: FUNDING_SIG, creatorAuth: GOLDEN_CREATOR_AUTH }).catch((e) => e);
+    expect(a.retryAfterMs).toBe(3000);
+    expect(b.retryAfterMs).toBeUndefined();
+    expect('retryAfterMs' in b).toBe(false);
   });
 });

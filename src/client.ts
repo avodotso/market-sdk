@@ -103,6 +103,15 @@ export interface MarketClientAgent {
   bearer?: string;
 }
 
+const RETRYABLE_FINALIZE_CODES = new Set(['FUNDING_TX_NOT_FOUND', 'FUNDING_TX_LOOKUP_FAILED']);
+
+export interface CreateMarketWithShadowPortfolioOpts {
+  /** Total finalize attempts while funding is unconfirmed. Default 4. */
+  maxFinalizeAttempts?: number;
+  /** Delay override, for tests. */
+  sleep?: (ms: number) => Promise<void>;
+}
+
 export interface MarketClientConfig extends HttpBaseConfig {
   /** When using the API gateway, provide its Authorization header separately
    *  from agent auth. A callback can refresh an expiring gateway credential.
@@ -244,6 +253,14 @@ export class MarketClient extends HttpBase {
    * `signMessage`, returning the 64-byte Ed25519 signature). This SDK never
    * touches the operator's signing material.
    *
+   * Finalize is retried on `FUNDING_TX_NOT_FOUND` (funding not yet
+   * confirmed) and `FUNDING_TX_LOOKUP_FAILED` up to `opts.maxFinalizeAttempts` times (default 4), honouring
+   * `Retry-After`. Each attempt needs a fresh single-use `creatorAuth`, so
+   * `signMessage` is called once per attempt. Any error thrown after funding
+   * carries `details.pendingId`, `details.agentPubkey` and
+   * `details.fundingSignature` so the caller can finish with
+   * `buildCreatorAuth` + `finalizeCreateMarket`.
+   *
    * Example with Dynamic's Solana adapter:
    * ```ts
    * await client.createMarketWithShadowPortfolio(
@@ -261,6 +278,7 @@ export class MarketClient extends HttpBase {
     body: PrepareCreateMarketBody,
     signFundingTx: (fundingTxBase64: string) => Promise<string>,
     signMessage: (message: Uint8Array) => Promise<Uint8Array>,
+    opts: CreateMarketWithShadowPortfolioOpts = {},
   ): Promise<FinalizeCreateMarketResp> {
     if (typeof signMessage !== 'function') {
       throw new AvoSdkError({
@@ -282,6 +300,7 @@ export class MarketClient extends HttpBase {
       });
     }
     const fundingSignature = await signFundingTx(prep.fundingTx);
+    const recovery = { pendingId: prep.pendingId, agentPubkey: prep.agentPubkey, fundingSignature };
     if (!fundingSignature || typeof fundingSignature !== 'string') {
       throw new AvoSdkError({
         status: 500,
@@ -289,20 +308,64 @@ export class MarketClient extends HttpBase {
         message:
           'createMarketWithShadowPortfolio: signFundingTx must return a non-empty ' +
           'Solana tx signature string.',
+        details: recovery,
       });
     }
-    const { creatorAuth } = await buildCreatorAuth({
-      creator: body.creator,
-      pendingId: prep.pendingId,
-      agentPubkey: prep.agentPubkey,
-      fundingSignature,
-      signMessage,
-    });
-    return this.finalizeCreateMarket({
-      agentPubkey: prep.agentPubkey,
-      fundingSignature,
-      creatorAuth,
-    });
+
+    const maxAttempts = Math.max(1, Math.floor(opts.maxFinalizeAttempts ?? 4));
+    const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+    for (let attempt = 1; ; attempt++) {
+      let creatorAuth: string;
+      try {
+        ({ creatorAuth } = await buildCreatorAuth({
+          creator: body.creator,
+          pendingId: prep.pendingId,
+          agentPubkey: prep.agentPubkey,
+          fundingSignature,
+          signMessage,
+        }));
+      } catch (err) {
+        throw new AvoSdkError({
+          status: 400,
+          code: 'CREATOR_AUTH_SIGN_FAILED',
+          message:
+            `createMarketWithShadowPortfolio: could not sign creatorAuth (${(err as Error).message}). ` +
+            'The agent is already funded; finish with buildCreatorAuth + finalizeCreateMarket ' +
+            'using details.pendingId / agentPubkey / fundingSignature.',
+          details: recovery,
+        });
+      }
+      try {
+        return await this.finalizeCreateMarket({
+          agentPubkey: prep.agentPubkey,
+          fundingSignature,
+          creatorAuth,
+        });
+      } catch (err) {
+        if (err instanceof AvoSdkError) {
+          if (RETRYABLE_FINALIZE_CODES.has(err.code) && attempt < maxAttempts) {
+            await sleep(Math.min(Math.max(err.retryAfterMs ?? 2000 * attempt, 500), 15_000));
+            continue;
+          }
+          throw new AvoSdkError({
+            status: err.status,
+            code: err.code,
+            message: err.message,
+            details: { ...recovery, upstream: err.details },
+            retryAfterMs: err.retryAfterMs,
+          });
+        }
+        throw new AvoSdkError({
+          status: 502,
+          code: 'FINALIZE_INCOMPLETE',
+          message:
+            `createMarketWithShadowPortfolio: finalize failed (${(err as Error).message}). ` +
+            'The agent is already funded; finish with buildCreatorAuth + finalizeCreateMarket ' +
+            'using details.pendingId / agentPubkey / fundingSignature.',
+          details: recovery,
+        });
+      }
+    }
   }
 
   /**

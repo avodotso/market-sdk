@@ -15,6 +15,7 @@ export {
   MarketClient,
   buildAttachMessage,
   type MarketClientConfig,
+  type CreateMarketWithShadowPortfolioOpts,
   type MarketClientAgent,
 } from './client';
 
@@ -34,6 +35,7 @@ export {
 export {
   FINALIZE_AUTH_AUDIENCE,
   FINALIZE_AUTH_MAX_TTL_SECS,
+  FINALIZE_AUTH_NONCE_RE,
   buildCreatorAuth,
   finalizeAuthMessage,
   generateFinalizeNonce,
