@@ -15,6 +15,7 @@ export {
   MarketClient,
   buildAttachMessage,
   type MarketClientConfig,
+  type CreateMarketWithShadowPortfolioOpts,
   type MarketClientAgent,
 } from './client';
 
@@ -27,6 +28,21 @@ export {
   type SignerFn,
   type SignerInput,
 } from './auth';
+
+// ---------------------------------------------------------------------------
+//  Finalize creator binding (`creatorAuth` for `finalizeCreateMarket`)
+// ---------------------------------------------------------------------------
+export {
+  FINALIZE_AUTH_AUDIENCE,
+  FINALIZE_AUTH_MAX_TTL_SECS,
+  FINALIZE_AUTH_NONCE_RE,
+  buildCreatorAuth,
+  finalizeAuthMessage,
+  generateFinalizeNonce,
+  type BuildCreatorAuthArgs,
+  type CreatorAuth,
+  type FinalizeAuthMessageArgs,
+} from './finalize-auth';
 
 // ---------------------------------------------------------------------------
 //  Config (single edit point for the API base URL)

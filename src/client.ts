@@ -34,6 +34,7 @@ import bs58 from 'bs58';
 import { HttpBase, type HttpBaseConfig } from './http-base';
 import { mintAuthToken, type SignerInput, type SignerFn } from './auth';
 import { AvoSdkError } from './errors';
+import { buildCreatorAuth } from './finalize-auth';
 import type {
   AddAssetBody,
   AddAssetResp,
@@ -100,6 +101,15 @@ export interface MarketClientAgent {
    *  `finalizeCreateMarket` / `registerMarket`. The API holds the agent's
    *  keypair encrypted at rest; you never touch the private key. */
   bearer?: string;
+}
+
+const RETRYABLE_FINALIZE_CODES = new Set(['FUNDING_TX_NOT_FOUND', 'FUNDING_TX_LOOKUP_FAILED']);
+
+export interface CreateMarketWithShadowPortfolioOpts {
+  /** Total finalize attempts while funding is unconfirmed. Default 4. */
+  maxFinalizeAttempts?: number;
+  /** Delay override, for tests. */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 export interface MarketClientConfig extends HttpBaseConfig {
@@ -215,8 +225,9 @@ export class MarketClient extends HttpBase {
   }
 
   /**
-   * Phase 2 of permissionless market creation. Verifies the funding
-   * transfer landed, then the custodial agent signs `create_market` +
+   * Phase 2 of permissionless market creation. Requires `creatorAuth`
+   * from `buildCreatorAuth`, signed by the creator wallet. Verifies it and
+   * the funding transfer, then the custodial agent signs `create_market` +
    * one `add_market_asset` per requested asset SERVER-SIDE. Returns the
    * marketPda + a one-time bearer.
    */
@@ -235,26 +246,61 @@ export class MarketClient extends HttpBase {
    * tab populate without any additional client calls. **Everything
    * needed to get the chart working is set up by this single method.**
    *
-   * The caller supplies a `signFundingTx` callback that takes the
-   * base64-encoded unsigned `VersionedTransaction` from phase 1, signs
-   * + submits it via the operator's wallet, and returns the Solana
-   * signature. This SDK never touches the operator's signing material.
+   * The caller supplies two callbacks backed by the `body.creator` wallet:
+   * `signFundingTx` takes the base64-encoded unsigned `VersionedTransaction`
+   * from phase 1, signs + submits it, and returns the Solana signature;
+   * `signMessage` signs the finalize `creatorAuth` message (a wallet
+   * `signMessage`, returning the 64-byte Ed25519 signature). This SDK never
+   * touches the operator's signing material.
+   *
+   * Finalize is retried on `FUNDING_TX_NOT_FOUND` (funding not yet
+   * confirmed) and `FUNDING_TX_LOOKUP_FAILED` up to `opts.maxFinalizeAttempts` times (default 4), honouring
+   * `Retry-After`. Each attempt needs a fresh single-use `creatorAuth`, so
+   * `signMessage` is called once per attempt. Any error thrown after funding
+   * carries `details.pendingId`, `details.agentPubkey` and
+   * `details.fundingSignature` so the caller can finish with
+   * `buildCreatorAuth` + `finalizeCreateMarket`.
    *
    * Example with Dynamic's Solana adapter:
    * ```ts
-   * await client.createMarketWithShadowPortfolio(body, async (txBase64) => {
-   *   const tx = VersionedTransaction.deserialize(Buffer.from(txBase64, 'base64'));
-   *   const result = await primaryWallet.signAndSendTransaction(tx);
-   *   return typeof result === 'string' ? result : result.signature;
-   * });
+   * await client.createMarketWithShadowPortfolio(
+   *   body,
+   *   async (txBase64) => {
+   *     const tx = VersionedTransaction.deserialize(Buffer.from(txBase64, 'base64'));
+   *     const result = await primaryWallet.signAndSendTransaction(tx);
+   *     return typeof result === 'string' ? result : result.signature;
+   *   },
+   *   (msg) => primaryWallet.signMessage(msg),
+   * );
    * ```
    */
   async createMarketWithShadowPortfolio(
     body: PrepareCreateMarketBody,
     signFundingTx: (fundingTxBase64: string) => Promise<string>,
+    signMessage: (message: Uint8Array) => Promise<Uint8Array>,
+    opts: CreateMarketWithShadowPortfolioOpts = {},
   ): Promise<FinalizeCreateMarketResp> {
+    if (typeof signMessage !== 'function') {
+      throw new AvoSdkError({
+        status: 400,
+        code: 'SIGN_MESSAGE_REQUIRED',
+        message:
+          'createMarketWithShadowPortfolio: signMessage is required to sign the ' +
+          'finalize creatorAuth with the creator wallet.',
+      });
+    }
     const prep = await this.prepareCreateMarket(body);
+    if (!prep.pendingId || typeof prep.pendingId !== 'string') {
+      throw new AvoSdkError({
+        status: 502,
+        code: 'PENDING_ID_MISSING',
+        message:
+          'createMarketWithShadowPortfolio: prepare response has no pendingId; ' +
+          'the API is too old for creator-bound finalize.',
+      });
+    }
     const fundingSignature = await signFundingTx(prep.fundingTx);
+    const recovery = { pendingId: prep.pendingId, agentPubkey: prep.agentPubkey, fundingSignature };
     if (!fundingSignature || typeof fundingSignature !== 'string') {
       throw new AvoSdkError({
         status: 500,
@@ -262,12 +308,64 @@ export class MarketClient extends HttpBase {
         message:
           'createMarketWithShadowPortfolio: signFundingTx must return a non-empty ' +
           'Solana tx signature string.',
+        details: recovery,
       });
     }
-    return this.finalizeCreateMarket({
-      agentPubkey: prep.agentPubkey,
-      fundingSignature,
-    });
+
+    const maxAttempts = Math.max(1, Math.floor(opts.maxFinalizeAttempts ?? 4));
+    const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+    for (let attempt = 1; ; attempt++) {
+      let creatorAuth: string;
+      try {
+        ({ creatorAuth } = await buildCreatorAuth({
+          creator: body.creator,
+          pendingId: prep.pendingId,
+          agentPubkey: prep.agentPubkey,
+          fundingSignature,
+          signMessage,
+        }));
+      } catch (err) {
+        throw new AvoSdkError({
+          status: 400,
+          code: 'CREATOR_AUTH_SIGN_FAILED',
+          message:
+            `createMarketWithShadowPortfolio: could not sign creatorAuth (${(err as Error).message}). ` +
+            'The agent is already funded; finish with buildCreatorAuth + finalizeCreateMarket ' +
+            'using details.pendingId / agentPubkey / fundingSignature.',
+          details: recovery,
+        });
+      }
+      try {
+        return await this.finalizeCreateMarket({
+          agentPubkey: prep.agentPubkey,
+          fundingSignature,
+          creatorAuth,
+        });
+      } catch (err) {
+        if (err instanceof AvoSdkError) {
+          if (RETRYABLE_FINALIZE_CODES.has(err.code) && attempt < maxAttempts) {
+            await sleep(Math.min(Math.max(err.retryAfterMs ?? 2000 * attempt, 500), 15_000));
+            continue;
+          }
+          throw new AvoSdkError({
+            status: err.status,
+            code: err.code,
+            message: err.message,
+            details: { ...recovery, upstream: err.details },
+            retryAfterMs: err.retryAfterMs,
+          });
+        }
+        throw new AvoSdkError({
+          status: 502,
+          code: 'FINALIZE_INCOMPLETE',
+          message:
+            `createMarketWithShadowPortfolio: finalize failed (${(err as Error).message}). ` +
+            'The agent is already funded; finish with buildCreatorAuth + finalizeCreateMarket ' +
+            'using details.pendingId / agentPubkey / fundingSignature.',
+          details: recovery,
+        });
+      }
+    }
   }
 
   /**

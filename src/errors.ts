@@ -9,18 +9,22 @@ export class AvoSdkError extends Error {
   readonly status: number;
   readonly code: string;
   readonly details?: unknown;
+  /** Parsed `Retry-After` response header, in milliseconds, when present. */
+  readonly retryAfterMs?: number;
 
   constructor(opts: {
     status: number;
     code: string;
     message: string;
     details?: unknown;
+    retryAfterMs?: number;
   }) {
     super(opts.message);
     this.name = 'AvoSdkError';
     this.status = opts.status;
     this.code = opts.code;
     this.details = opts.details;
+    if (opts.retryAfterMs !== undefined) this.retryAfterMs = opts.retryAfterMs;
   }
 }
 
