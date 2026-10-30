@@ -397,7 +397,14 @@ export class MarketClient extends HttpBase {
   listMarkets(params: ListMarketsParams = {}): Promise<ListMarketsResp> {
     return this.callAvo('GET', '/v1/markets', {
       auth: false,
-      query: { limit: params.limit, offset: params.offset },
+      query: {
+        limit: params.limit,
+        offset: params.offset,
+        includeClosed: params.includeClosed,
+        marketPda: params.marketPda,
+        portfolioServiceId: params.portfolioServiceId,
+        sort: params.sort,
+      },
     });
   }
 

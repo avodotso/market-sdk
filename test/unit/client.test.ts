@@ -311,6 +311,20 @@ describe('MarketClient — public reads', () => {
     expect(url.searchParams.get('offset')).toBe('50');
   });
 
+  it('GET /v1/markets passes the listing filters and omits unset ones', async () => {
+    const { fn, requests } = captureFetch(() =>
+      jsonResponse({ markets: [], limit: 50, offset: 0, total: 0 }),
+    );
+    const client = new MarketClient({ services: { avoApi: AVO_API }, fetch: fn });
+    await client.listMarkets({ includeClosed: true, sort: 'popular', marketPda: 'PDA' });
+    const url = new URL(requests[0].url);
+    expect(url.searchParams.get('includeClosed')).toBe('true');
+    expect(url.searchParams.get('sort')).toBe('popular');
+    expect(url.searchParams.get('marketPda')).toBe('PDA');
+    expect(url.searchParams.has('portfolioServiceId')).toBe(false);
+    expect(url.searchParams.has('limit')).toBe(false);
+  });
+
   it('GET /v1/markets/:pda/events accepts a `before` cursor', async () => {
     const { fn, requests } = captureFetch(() =>
       jsonResponse({ events: [], oldest: null }),

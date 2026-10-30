@@ -78,6 +78,8 @@ export type {
   ListMarketsResp,
   MarketSummary,
   AgentRatingBlock,
+  DepositMinimumSummary,
+  MarketEligibility,
   MarketEvent,
   MarketEventsResp,
   GetMarketEventsParams,

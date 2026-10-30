@@ -9,10 +9,13 @@
 //  Health
 // ---------------------------------------------------------------------------
 
+/** `GET /healthz`. api.avo.so returns exactly these three fields. */
 export interface HealthResp {
-  status: 'ok';
-  rpcSlot: number;
-  version: string;
+  /** `'degraded'` when the RPC or database probe failed. Gate on `status === 'ok'`. */
+  status: 'ok' | 'degraded';
+  /** Null when the RPC probe failed. */
+  rpcSlot: number | null;
+  version: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -29,10 +32,10 @@ export interface PrepareCreateMarketBody {
    *  swap is `platformFeeBps + marketFeeBps`; the on-chain handler caps
    *  the sum at 10_000. */
   marketFeeBps: number;
-  /** Operator-facing label. */
+  /** Operator-facing label (max 120 chars). */
   label?: string;
   /** Trade-asset mints to register at create time (each registered at
-   *  0% target weight). Max 8. */
+   *  0% target weight). Max 24. */
   assetMints?: string[];
   /** Initial target-weight map keyed by mint, plus the special `'base'`
    *  key. Must sum to exactly 10_000 (100%). When set, finalize lands
@@ -40,6 +43,15 @@ export interface PrepareCreateMarketBody {
   initialWeights?: Record<string, number>;
   /** Off-chain metadata pointer (200 char cap). */
   marketMetadataUri?: string;
+  /** HTTPS or `ipfs://` image URL for the market card (500 char cap). */
+  portfolioImage?: string;
+  /** `'managed'` (driven from the Avo app) or `'programmatic'` (bearer /
+   *  script driven). Server default `'programmatic'`. */
+  marketType?: 'managed' | 'programmatic';
+  /** Programmatic markets only: `'index'` (default) or `'agent'`. */
+  programmaticVariant?: 'index' | 'agent';
+  /** Market description shown on the market page (2000 char cap). */
+  description?: string;
 }
 
 export interface PrepareCreateMarketResp {
@@ -50,6 +62,8 @@ export interface PrepareCreateMarketResp {
   /** Base64-encoded unsigned `VersionedTransaction`. Creator signs +
    *  submits, then calls `finalizeCreateMarket`. */
   fundingTx: string;
+  /** Transaction version of `fundingTx`. */
+  version: 'legacy' | 0 | 1;
   nextStep: string;
 }
 
@@ -73,6 +87,9 @@ export interface FinalizeCreateMarketResp {
   createMarketSignature: string;
   assetSignatures: string[];
   weightSetSignatures: { prepare: string; settle: string } | null;
+  /** The market's on-chain deposit gate after finalize. `null` when it could
+   *  not be verified. */
+  depositsOpen?: boolean | null;
   identity: {
     coreAssetAddress: string;
     agentUri: string;
@@ -80,9 +97,14 @@ export interface FinalizeCreateMarketResp {
     collection: string;
   } | null;
   /** One-time bearer token — store immediately. The API only retains its
-   *  sha256. Used for custodial-mode auth on subsequent agent-op calls. */
+   *  sha256. Used for custodial-mode auth on subsequent agent-op calls.
+   *  Empty string when `converged` is true: a retried finalize never
+   *  re-issues the bearer. Mint a new one with `POST /v1/markets/bearer/rotate`. */
   bearer: string;
   bearerHashHex: string;
+  /** True when an earlier finalize already created this market. No on-chain
+   *  work ran and no bearer was minted. */
+  converged?: boolean;
 }
 
 export interface RegisterMarketBody {
@@ -107,6 +129,8 @@ export interface RegisterMarketResp {
   /** One-time bearer token. Re-register the same market to rotate. */
   bearer: string;
   bearerHashHex: string;
+  /** Shadow portfolio id in portfolio-service, when registered. */
+  portfolioServiceId: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +142,15 @@ export interface ListMarketsParams {
   limit?: number;
   /** Skip-N offset; default 0. */
   offset?: number;
+  /** Include closed markets. Default false. */
+  includeClosed?: boolean;
+  /** Exact lookup of one market by PDA (also returns markets hidden from the
+   *  default listing). */
+  marketPda?: string;
+  /** Filter by shadow portfolio id. */
+  portfolioServiceId?: string;
+  /** Default `'newest'`. */
+  sort?: 'newest' | 'popular';
 }
 
 export interface AgentRatingBlock {
@@ -127,11 +160,44 @@ export interface AgentRatingBlock {
   computedAt: string;
 }
 
-/** One entry in `listMarkets()`. */
+export interface DepositMinimumSummary {
+  status: 'available' | 'unavailable' | 'pending';
+  minimumUsd: number | null;
+  averageDepositUsd: number;
+  aboveAverageDeposit: boolean;
+  defaultMinimumUsd: number | null;
+  requiredToleranceBps: number | null;
+  suggestedToleranceBps: number | null;
+  warning: string | null;
+  reason:
+    | 'unroutable_asset'
+    | 'token_floor_pending'
+    | 'quote_transport_error'
+    | 'higher_price_impact'
+    | 'no_passing_amount'
+    | 'unpriced_asset'
+    | null;
+  computedAt: string | null;
+}
+
+export interface MarketEligibility {
+  restricted: boolean;
+  code: 'LOCATION_RESTRICTED' | 'LOCATION_UNKNOWN' | 'LOCATION_INVALID' | 'GEOFENCE_UNAVAILABLE' | null;
+  message: string | null;
+  policyRevision: number;
+  restrictedMints: string[];
+}
+
+/** One market, as returned by `listMarkets()`. */
 export interface MarketSummary {
   marketPda: string;
   marketIndex: number;
   label: string | null;
+  description: string | null;
+  creator: string;
+  marketType: 'managed' | 'programmatic';
+  /** True for agent-driven programmatic markets. */
+  agentic: boolean;
   agentPubkey: string;
   agentLabel: string | null;
   agentIdentityCollection: string | null;
@@ -144,11 +210,40 @@ export interface MarketSummary {
   feeAssetMint: string;
   targetAssetCount: number;
   baseTargetWeightBps: number;
-  totalShares: string;
-  lastTotalValueBase: string;
+  /** Base atomic units per share atomic unit, as a decimal string with
+   *  exactly 12 fractional digits. Null when the share supply is zero or the
+   *  on-chain read is degraded. Public. */
+  navPerShare: string | null;
+  /** Whether the market has a non-zero share supply. Null when unknown. */
+  funded: boolean | null;
+  /** Share supply (u64 decimal string). Returned only to admin callers and
+   *  the market creator (request-bound `Sig2`); absent on public reads. */
+  totalShares?: string;
+  /** Cached market total value in base atomic units. Same visibility as
+   *  `totalShares`: absent on public reads. */
+  lastTotalValueBase?: string;
   lastNavTs: number;
   marketFeeBps: number;
+  platformFeeBps: number;
+  portfolioImage: string | null;
+  portfolioServiceId: string | null;
+  lookupTable: string | null;
+  closedAt: string | null;
+  closingAt: string | null;
+  depositsOpen: boolean;
+  onchainDepositGate: 'open' | 'closed' | 'unknown';
+  closingReason:
+    | 'shares_outstanding'
+    | 'pending_plans'
+    | 'deposit_gate_open'
+    | 'awaiting_program_support'
+    | null;
+  depositMinimum: DepositMinimumSummary;
   rating: AgentRatingBlock | null;
+  /** Per-caller geofence view. Informational. */
+  eligibility: MarketEligibility;
+  /** Market AUM in USD, refreshed at most every 90 s. Null when not valued. */
+  aumUsd: number | null;
 }
 
 export interface ListMarketsResp {
@@ -157,6 +252,8 @@ export interface ListMarketsResp {
   offset: number;
   /** Total markets in the catalog before paging. */
   total: number;
+  /** True when the on-chain read failed and some fields are placeholders. */
+  degraded?: boolean;
 }
 
 export interface MarketEvent {
@@ -168,6 +265,9 @@ export interface MarketEvent {
   /** Solana tx signature — present on TRANSACTION events. */
   signature: string | null;
   slot: number | null;
+  /** The market PDA the event belongs to. */
+  portfolio_id?: string;
+  process_id?: string | null;
 }
 
 export interface MarketEventsResp {
@@ -184,14 +284,24 @@ export interface GetMarketEventsParams {
 }
 
 export interface NavHistoryPoint {
-  /** u64 decimal string (base atomic units). */
-  totalValueBase: string;
+  /** Base atomic units per share atomic unit, decimal string with exactly 12
+   *  fractional digits. Flow-neutral: use this for charts and returns. Public
+   *  history only contains points where it is non-null. */
+  navPerShare: string | null;
   /** Unix seconds — `nav_ts` when this point was recorded on chain. */
   lastNavTs: number;
-  /** Tx signature for the `update_nav` call, when known. */
-  signature: string | null;
   /** ISO 8601 timestamp the API wrote the row. */
   recordedAt: string;
+  /** Market total value (u64 decimal string, base atomic units). Returned
+   *  only to admin callers and the market creator (request-bound `Sig2`);
+   *  absent on public reads, which is how `getNavHistory` calls. */
+  totalValueBase?: string;
+  /** Share supply at this snapshot. Same visibility as `totalValueBase`. */
+  totalShares?: string | null;
+  /** True when value and supply came from one market read. Same visibility. */
+  sharesPaired?: boolean;
+  /** Tx signature of the `update_nav` call. Same visibility. */
+  signature?: string | null;
 }
 
 export interface NavHistoryResp {
