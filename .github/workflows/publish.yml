@@ -23,7 +23,7 @@ permissions:
 jobs:
   check:
     name: Check version bump
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     outputs:
       version: ${{ steps.local.outputs.version }}
       should_publish: ${{ steps.compare.outputs.should_publish }}
@@ -72,7 +72,7 @@ jobs:
     name: Publish to npm
     needs: check
     if: needs.check.outputs.should_publish == 'true'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
 
