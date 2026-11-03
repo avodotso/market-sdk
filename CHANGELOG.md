@@ -39,6 +39,7 @@ If your code reads `m.totalShares`, `m.lastTotalValueBase` or `point.totalValueB
 ### Changed
 
 - `createMarketWithShadowPortfolio()` also retries **`FUNDING_TX_NOT_FINALIZED`**. Since market-service #220, finalize acts only on a *finalized* funding transfer and answers `409 FUNDING_TX_NOT_FINALIZED` with `Retry-After` while it is confirmed but not final. Each retry signs a fresh `creatorAuth`, as before.
+- `createMarketWithShadowPortfolio()` retries are bounded. `maxFinalizeAttempts` must be an integer 1–20 (default 4); `Infinity` used to retry forever. New `finalizeDeadlineMs` (integer 1 000–900 000, default 180 000) stops new attempts once the wall-clock budget from funding is spent, setting `details.deadlineExceeded`. Invalid values throw `INVALID_FINALIZE_OPTIONS` before anything is funded. `MAX_FINALIZE_ATTEMPTS`, `DEFAULT_FINALIZE_DEADLINE_MS` and `MAX_FINALIZE_DEADLINE_MS` are exported.
 - Unchanged, by design: the helper does **not** retry finalize's `503` codes (`FINALIZE_IN_PROGRESS`, `FINALIZE_LEASE_LOST`, `FINALIZE_LOOKUP_TABLE_UNRESOLVED`, `FINALIZE_UNAVAILABLE`). They mean another finalize for the same agent is running or has not settled, and retrying can converge on that market with an empty `bearer`; the caller must decide (see the README's create-market section).
 
 ## 0.3.0

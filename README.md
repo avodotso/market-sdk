@@ -118,11 +118,11 @@ const result = await client.finalizeCreateMarket({
   creatorAuth,
 });
 
-console.log({
-  marketPda: result.marketPda,
-  agentPubkey: result.agentPubkey,
-  bearer: result.bearer, // STORE NOW — shown ONCE
-});
+// The bearer is shown once and is a live credential: write it straight to
+// your secret manager (Vault, AWS Secrets Manager, Doppler, …). Never log it.
+declare const secrets: { set(name: string, value: string): Promise<void> };
+await secrets.set(`avo/markets/${result.marketPda}/bearer`, result.bearer);
+console.log('created market', result.marketPda);
 ```
 
 `creatorAuth` is valid for at most 110 seconds (default 60) and its nonce is single-use, so build a new one for every finalize attempt. Finalize acts only on a **finalized** funding transfer: while it hasn't landed it returns `FUNDING_TX_NOT_FOUND`, while it is confirmed but not final `FUNDING_TX_NOT_FINALIZED`, and on an RPC outage `FUNDING_TX_LOOKUP_FAILED` (all three are in `RETRYABLE_FINALIZE_CODES`); wait `err.retryAfterMs` and retry with a fresh `creatorAuth`. A retry of a finalize that already succeeded returns the same market with `converged: true` and an empty `bearer` (mint a new one with `POST /v1/markets/bearer/rotate`). Other refusals: `CREATOR_AUTH_REQUIRED`, `CREATOR_AUTH_EXPIRED`, `CREATOR_AUTH_INVALID`, `CREATOR_MISMATCH`, `CREATOR_AUTH_REPLAYED`, `BAD_FUNDING_SIGNATURE` and the other `FUNDING_*` codes. `expiresAtMs` comes from your local clock and the API refuses values more than 120 s ahead, so a clock running fast by more than 120 s minus the TTL gets `CREATOR_AUTH_EXPIRED`.
@@ -141,7 +141,7 @@ const result = await client.createMarketWithShadowPortfolio(
 );
 ```
 
-The helper retries every code in `RETRYABLE_FINALIZE_CODES` (`FUNDING_TX_NOT_FOUND`, `FUNDING_TX_NOT_FINALIZED`, `FUNDING_TX_LOOKUP_FAILED`; up to 4 attempts by default, `{ maxFinalizeAttempts }` as a fourth argument), calling `signMessage` once per attempt. Any error it throws after funding carries `details.pendingId`, `details.agentPubkey` and `details.fundingSignature`, so you can finish with `buildCreatorAuth` + `finalizeCreateMarket`.
+The helper retries every code in `RETRYABLE_FINALIZE_CODES` (`FUNDING_TX_NOT_FOUND`, `FUNDING_TX_NOT_FINALIZED`, `FUNDING_TX_LOOKUP_FAILED`), calling `signMessage` once per attempt. Retries are bounded: `{ maxFinalizeAttempts }` (integer 1–20, default 4) and `{ finalizeDeadlineMs }` (wall clock from funding, integer 1 000–900 000 ms, default 180 000; no new attempt starts after it) as a fourth argument. Out-of-range values throw `INVALID_FINALIZE_OPTIONS` before anything is funded. When the deadline stops retries, the error's `details.deadlineExceeded` is `true`. Any error it throws after funding carries `details.pendingId`, `details.agentPubkey` and `details.fundingSignature`, so you can finish with `buildCreatorAuth` + `finalizeCreateMarket`.
 
 It deliberately does **not** retry finalize's `503`s (`FINALIZE_IN_PROGRESS`, `FINALIZE_LEASE_LOST`, `FINALIZE_LOOKUP_TABLE_UNRESOLVED`, `FINALIZE_UNAVAILABLE`). They mean another finalize for the same agent is running, or one stopped part-way and has not settled. Retrying from here can converge on the market that other attempt is still creating, which returns `converged: true` with an **empty `bearer`**: the bearer goes to the attempt that created the market, so a helper that retried would hand you a market with no credential. Surface these to the caller instead: wait (`err.retryAfterMs` when set), check whether the market now exists, and finish with `finalizeCreateMarket` or rotate the bearer with `POST /v1/markets/bearer/rotate`.
 
@@ -219,7 +219,7 @@ import { MarketClient } from '@avodotso/market-sdk';
 new MarketClient({
   services: { avoApi: 'https://api.avo.so' },
   agent: {
-    bearer: 'mb_8e3f…',                // stored from finalizeCreateMarket
+    bearer: process.env.AGENT_BEARER!, // from your secret manager; never hard-code or log it
     publicKey: kp.publicKey.toBytes(), // optional; enables getOwnIdentity()
   },
 });
