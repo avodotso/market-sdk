@@ -121,6 +121,12 @@ const result = await client.finalizeCreateMarket({
 // The bearer is shown once and is a live credential: write it straight to
 // your secret manager (Vault, AWS Secrets Manager, Doppler, …). Never log it.
 declare const secrets: { set(name: string, value: string): Promise<void> };
+if (result.converged || !result.bearer) {
+  // An earlier finalize already created this market and issued its bearer; it
+  // is never re-issued. Keep the one you stored. If you no longer have it, mint
+  // a new one: POST /v1/markets/bearer/rotate { marketPda } as the creator.
+  throw new Error(`market ${result.marketPda} already existed; not saving an empty bearer`);
+}
 await secrets.set(`avo/markets/${result.marketPda}/bearer`, result.bearer);
 console.log('created market', result.marketPda);
 ```
