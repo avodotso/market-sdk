@@ -8,7 +8,9 @@ npm install @avodotso/market-sdk
 yarn add @avodotso/market-sdk
 ```
 
-The SDK exports one primary class — `MarketClient` — that covers the entire market-maker journey: create → operate → close. No internal-only services, no chain-side ix builders, just the public HTTP API.
+The SDK exports one primary class — `MarketClient` — that covers the entire market-maker journey: create → operate → close. No internal-only services, no chain-side ix builders, just the public HTTP API at **`https://api.avo.so`**.
+
+Upgrading from 0.3.x? See [CHANGELOG.md](./CHANGELOG.md): 1.0.0 changes types only (public reads never carry raw totals) and adds a finalize retry code.
 
 ---
 
@@ -22,7 +24,7 @@ You hold a bearer token (returned from `finalizeCreateMarket` or `registerMarket
 import { MarketClient } from '@avodotso/market-sdk';
 
 const client = new MarketClient({
-  services: { avoApi: 'https://portfolio-contract-api-service-dev.up.railway.app' },
+  services: { avoApi: 'https://api.avo.so' },
   agent: { bearer: process.env.AGENT_BEARER! },
 });
 
@@ -52,17 +54,18 @@ You hold the agent's 64-byte Ed25519 secret key yourself; the SDK mints fresh si
 import { MarketClient } from '@avodotso/market-sdk';
 import { Keypair } from '@solana/web3.js';
 
-const agentKp = Keypair.fromSecretKey(/* your agent's 64-byte secret key */);
+declare const agentSecretKey: Uint8Array; // your agent's 64-byte secret key
+const agentKp = Keypair.fromSecretKey(agentSecretKey);
 
 const client = new MarketClient({
-  services: { avoApi: 'https://portfolio-contract-api-service-dev.up.railway.app' },
+  services: { avoApi: 'https://api.avo.so' },
   agent: {
     publicKey: agentKp.publicKey.toBytes(),
     secretKey: agentKp.secretKey,
   },
 });
 
-await client.rebalance({ /* ... */ });
+await client.rebalance({ weights: [{ asset: 'base', weightBps: 10_000 }] });
 ```
 
 External signers (KMS / hardware wallet / Turnkey) are supported via `agent.signer` — see [Auth model](#auth-model) below.
@@ -75,7 +78,11 @@ The API generates a fresh agent keypair custodially. You sign the funding tx wit
 import { MarketClient, buildCreatorAuth } from '@avodotso/market-sdk';
 import { VersionedTransaction } from '@solana/web3.js';
 
-const client = new MarketClient({ services: { avoApi: 'https://portfolio-contract-api-service-dev.up.railway.app' } });
+// Market creation on api.avo.so requires an Avo API key (avo_pk_…).
+const client = new MarketClient({
+  services: { avoApi: 'https://api.avo.so' },
+  gatewayAuthorization: `Bearer ${process.env.AVO_API_KEY}`,
+});
 
 // Phase 1: register intent + receive an unsigned 0.1 SOL funding tx.
 const prep = await client.prepareCreateMarket({
@@ -111,18 +118,26 @@ const result = await client.finalizeCreateMarket({
   creatorAuth,
 });
 
-console.log({
-  marketPda: result.marketPda,
-  agentPubkey: result.agentPubkey,
-  bearer: result.bearer, // STORE NOW — shown ONCE
-});
+// The bearer is shown once and is a live credential: write it straight to
+// your secret manager (Vault, AWS Secrets Manager, Doppler, …). Never log it.
+declare const secrets: { set(name: string, value: string): Promise<void> };
+if (result.converged || !result.bearer) {
+  // An earlier finalize already created this market and issued its bearer; it
+  // is never re-issued. Keep the one you stored. If you no longer have it, mint
+  // a new one: POST /v1/markets/bearer/rotate { marketPda } as the creator.
+  throw new Error(`market ${result.marketPda} already existed; not saving an empty bearer`);
+}
+await secrets.set(`avo/markets/${result.marketPda}/bearer`, result.bearer);
+console.log('created market', result.marketPda);
 ```
 
-`creatorAuth` is valid for at most 110 seconds (default 60) and its nonce is single-use, so build a new one for every finalize attempt. If the funding tx isn't confirmed yet, finalize returns `FUNDING_TX_NOT_FOUND` (or `FUNDING_TX_LOOKUP_FAILED`); wait `err.retryAfterMs` and retry with a fresh `creatorAuth`. Other refusals: `CREATOR_AUTH_REQUIRED`, `CREATOR_AUTH_EXPIRED`, `CREATOR_AUTH_INVALID`, `CREATOR_MISMATCH`, `CREATOR_AUTH_REPLAYED`, `BAD_FUNDING_SIGNATURE` and the other `FUNDING_*` codes. `expiresAtMs` comes from your local clock and the API refuses values more than 120 s ahead, so a clock running fast by more than 120 s minus the TTL gets `CREATOR_AUTH_EXPIRED`.
+`creatorAuth` is valid for at most 110 seconds (default 60) and its nonce is single-use, so build a new one for every finalize attempt. Finalize acts only on a **finalized** funding transfer: while it hasn't landed it returns `FUNDING_TX_NOT_FOUND`, while it is confirmed but not final `FUNDING_TX_NOT_FINALIZED`, and on an RPC outage `FUNDING_TX_LOOKUP_FAILED` (all three are in `RETRYABLE_FINALIZE_CODES`); wait `err.retryAfterMs` and retry with a fresh `creatorAuth`. A retry of a finalize that already succeeded returns the same market with `converged: true` and an empty `bearer` (mint a new one with `POST /v1/markets/bearer/rotate`). Other refusals: `CREATOR_AUTH_REQUIRED`, `CREATOR_AUTH_EXPIRED`, `CREATOR_AUTH_INVALID`, `CREATOR_MISMATCH`, `CREATOR_AUTH_REPLAYED`, `BAD_FUNDING_SIGNATURE` and the other `FUNDING_*` codes. `expiresAtMs` comes from your local clock and the API refuses values more than 120 s ahead, so a clock running fast by more than 120 s minus the TTL gets `CREATOR_AUTH_EXPIRED`.
 
 One call does all of the above:
 
 ```ts
+import { VersionedTransaction } from '@solana/web3.js';
+
 const result = await client.createMarketWithShadowPortfolio(
   body,
   async (fundingTxBase64) => myWallet.signAndSendTransaction(
@@ -132,7 +147,9 @@ const result = await client.createMarketWithShadowPortfolio(
 );
 ```
 
-The helper retries `FUNDING_TX_NOT_FOUND` / `FUNDING_TX_LOOKUP_FAILED` (up to 4 attempts by default, `{ maxFinalizeAttempts }` as a fourth argument), calling `signMessage` once per attempt. Any error it throws after funding carries `details.pendingId`, `details.agentPubkey` and `details.fundingSignature`, so you can finish with `buildCreatorAuth` + `finalizeCreateMarket`.
+The helper retries every code in `RETRYABLE_FINALIZE_CODES` (`FUNDING_TX_NOT_FOUND`, `FUNDING_TX_NOT_FINALIZED`, `FUNDING_TX_LOOKUP_FAILED`), calling `signMessage` once per attempt. Retries are bounded: `{ maxFinalizeAttempts }` (integer 1–20, default 4) and `{ finalizeDeadlineMs }` (wall clock from funding, integer 1 000–900 000 ms, default 180 000; no new attempt starts after it) as a fourth argument. Out-of-range values throw `INVALID_FINALIZE_OPTIONS` before anything is funded. When the deadline stops retries, the error's `details.deadlineExceeded` is `true`. Any error it throws after funding carries `details.pendingId`, `details.agentPubkey` and `details.fundingSignature`, so you can finish with `buildCreatorAuth` + `finalizeCreateMarket`.
+
+It deliberately does **not** retry finalize's `503`s (`FINALIZE_IN_PROGRESS`, `FINALIZE_LEASE_LOST`, `FINALIZE_LOOKUP_TABLE_UNRESOLVED`, `FINALIZE_UNAVAILABLE`). They mean another finalize for the same agent is running, or one stopped part-way and has not settled. Retrying from here can converge on the market that other attempt is still creating, which returns `converged: true` with an **empty `bearer`**: the bearer goes to the attempt that created the market, so a helper that retried would hand you a market with no credential. Surface these to the caller instead: wait (`err.retryAfterMs` when set), check whether the market now exists, and finish with `finalizeCreateMarket` or rotate the bearer with `POST /v1/markets/bearer/rotate`.
 
 **Upgrading from 0.2.x:** `finalizeCreateMarket` now requires `creatorAuth`, and `createMarketWithShadowPortfolio` takes a required third `signMessage` argument. Both must be signed by `body.creator`.
 
@@ -168,12 +185,14 @@ const result = await client.registerMarket({
 
 | Method | Endpoint | Notes |
 |---|---|---|
-| `healthz()` | `GET /healthz` | API liveness. |
-| `listMarkets({ limit, offset })` | `GET /v1/markets` | Paginated catalog. |
+| `healthz()` | `GET /healthz` | `{ status: 'ok' \| 'degraded', rpcSlot, version }`. |
+| `listMarkets({ limit, offset, includeClosed, marketPda, sort })` | `GET /v1/markets` | Paginated catalog (limit ≤ 200). |
 | `getMarketEvents(pda, { limit, before })` | `GET /v1/markets/{pda}/events` | On-chain activity log; paged via `before` cursor. |
 | `getNavHistory(pda, { limit, order, from, to })` | `GET /v1/markets/{pda}/nav-history` | NAV time series. `from`/`to` accept `Date` or ISO string. |
 | `getIdentity(agentPubkey)` | `GET /v1/agents/identity/{pubkey}` | MPL-8004 identity + reputation. |
-| `attachIdentity(body)` | `POST /v1/agents/identity/attach` | Attach a Core NFT identity (signature-gated, permissionless). |
+| `attachIdentity(body)` | `POST /v1/agents/identity/attach` | Attach a Core NFT identity (signature-gated; on api.avo.so it needs an API key). |
+
+Public reads never include raw market value, vault balances or share supply: `MarketSummary.totalShares` / `lastTotalValueBase` and `NavHistoryPoint.totalValueBase` / `totalShares` / `signature` are returned only to the market creator (request-bound `Sig2`) and admins, so they are optional in the types. Use `navPerShare` (a decimal string with 12 fractional digits, flow-neutral) for charts and returns. The listing also carries `aumUsd`.
 
 ### Agent ops (authenticated — requires `agent` in constructor)
 
@@ -198,13 +217,15 @@ const result = await client.registerMarket({
 
 ### Bearer (custodial)
 
-The agent's secret key stays encrypted inside the API. You only hold the one-time bearer returned by `finalizeCreateMarket` / `registerMarket`. **Recommended default** for hosted market-makers — no key management on your side, and the bearer is a single short string you can rotate by re-registering the market.
+The agent's secret key stays encrypted inside the API. You only hold the one-time bearer returned by `finalizeCreateMarket` / `registerMarket`. **Recommended default** for hosted market-makers — no key management on your side, and the bearer is a single short string you can rotate with `POST /v1/markets/bearer/rotate` (as the agent, or as the creator with a creator `Sig`), or by re-registering a market you registered yourself.
 
 ```ts
+import { MarketClient } from '@avodotso/market-sdk';
+
 new MarketClient({
-  services: { avoApi: 'https://portfolio-contract-api-service-dev.up.railway.app' },
+  services: { avoApi: 'https://api.avo.so' },
   agent: {
-    bearer: 'mb_8e3f…',                // stored from finalizeCreateMarket
+    bearer: process.env.AGENT_BEARER!, // from your secret manager; never hard-code or log it
     publicKey: kp.publicKey.toBytes(), // optional; enables getOwnIdentity()
   },
 });
@@ -216,7 +237,7 @@ Stamps `Authorization: Bearer <token>` on every agent-op call. The API hashes th
 
 - The bearer **cannot sign on-chain transactions outside our API** — it's not a Solana keypair.
 - The bearer **cannot withdraw the agent's keypair** — that material never leaves the API's at-rest encryption.
-- Rotation is one HTTP call: re-register the same market.
+- Rotation is one HTTP call: `POST /v1/markets/bearer/rotate` (body `{ marketPda }`).
 
 ### Sig (self-custodial)
 
@@ -231,6 +252,8 @@ avo-portfolio-api/v1
 In-process secret:
 
 ```ts
+import { MarketClient } from '@avodotso/market-sdk';
+
 new MarketClient({
   agent: {
     publicKey: kp.publicKey.toBytes(),
@@ -242,6 +265,8 @@ new MarketClient({
 External signer (KMS / hardware wallet / Turnkey):
 
 ```ts
+import { MarketClient } from '@avodotso/market-sdk';
+
 new MarketClient({
   agent: {
     publicKey: kp.publicKey.toBytes(),
@@ -278,10 +303,10 @@ const { token, expiresAtMs } = await mintAuthToken({
 `MarketClient` reads the API base URL from `AvoServiceConfig`. Just one slot:
 
 ```ts
-import { resolveServiceConfig } from '@avodotso/market-sdk';
+import { MarketClient, resolveServiceConfig } from '@avodotso/market-sdk';
 
 const services = resolveServiceConfig({
-  avoApi: 'https://portfolio-contract-api-service-dev.up.railway.app',
+  avoApi: 'https://api.avo.so',
 });
 
 const client = new MarketClient({ services });
@@ -290,8 +315,10 @@ const client = new MarketClient({ services });
 You can pass a custom `fetch` for testing or instrumentation:
 
 ```ts
+import { MarketClient } from '@avodotso/market-sdk';
+
 new MarketClient({
-  services: { avoApi: 'https://portfolio-contract-api-service-dev.up.railway.app' },
+  services: { avoApi: 'https://api.avo.so' },
   fetch: myInstrumentedFetch,
 });
 ```
@@ -306,7 +333,7 @@ Every HTTP failure throws `AvoSdkError`. Network failures (DNS / connection refu
 import { AvoSdkError, AvoTransportError } from '@avodotso/market-sdk';
 
 try {
-  await client.rebalance({ /* ... */ });
+  await client.rebalance({ weights: [{ asset: 'base', weightBps: 10_000 }] });
 } catch (err) {
   if (err instanceof AvoSdkError) {
     console.error(err.status, err.code, err.message, err.details);
@@ -327,77 +354,45 @@ try {
 | `AGENT_AUTH_AMBIGUOUS` | Constructor got both signer credentials and a bearer. |
 | `AGENT_PUBLIC_KEY_MISSING` | Sig mode constructor without `publicKey`. |
 | `AGENT_AUTH_EMPTY` | Constructor got `agent: {}` with no auth material. |
+| `GATEWAY_AUTH_EMPTY` | `gatewayAuthorization` resolved to an empty string. |
+| `SIGN_MESSAGE_REQUIRED`, `PENDING_ID_MISSING`, `INVALID_FUNDING_SIGNATURE`, `CREATOR_AUTH_SIGN_FAILED`, `FINALIZE_INCOMPLETE` | `createMarketWithShadowPortfolio` could not finish; after funding, `details` carries `pendingId`, `agentPubkey`, `fundingSignature`. |
 | `HTTP_<status>` | API returned a non-2xx with no parseable error envelope. |
 
-All other `code` values come straight from the API's error envelope.
+All other `code` values come straight from the API's error envelope. `err.retryAfterMs` is set when the API sent `Retry-After` (e.g. `429 RATE_LIMITED`, `409 FUNDING_TX_NOT_FOUND` / `FUNDING_TX_NOT_FINALIZED`, `503 FINALIZE_IN_PROGRESS`).
 
 ---
 
 ## Versioning
 
-Semver. Anything documented above is stable.
+Semver. Anything documented above is stable from 1.0.0. Release notes: [CHANGELOG.md](./CHANGELOG.md).
 
 ## License
 
 ISC. See `LICENSE`.
 
 
-## Service compatibility (0.2.1)
+## API compatibility (1.0.0)
 
-Pin `@avodotso/market-sdk` to **`0.2.1`** in worker dependencies and regenerate
-locks after that version is published. Do not use `latest` for scheduled workers.
-This package publishes to public npm; `@avodotso/portfolio-internal` is a separate
-service-side package with program-deployment constraints.
+Pin `@avodotso/market-sdk` to an exact version (**`1.0.0`**) in worker dependencies; do not float `latest` for scheduled workers. This package publishes to public npm; `@avodotso/portfolio-internal` is a separate service-side package.
 
-For a gateway URL, supply the gateway's full Authorization header independently
-of the market agent credential:
+**api.avo.so** is the public endpoint. Send your Avo API key as the gateway credential; the SDK then sends agent auth in `x-avo-agent-authorization`:
 
 ```ts
+import { MarketClient } from '@avodotso/market-sdk';
+
 const client = new MarketClient({
-  services: { avoApi: 'https://dev-avo-fe-api.up.railway.app' },
-  gatewayAuthorization: async () => getGatewayAuthorization(),
+  services: { avoApi: 'https://api.avo.so' },
+  gatewayAuthorization: `Bearer ${process.env.AVO_API_KEY}`, // avo_pk_…
   agent: { bearer: agentBearer },
 });
 ```
 
-`getGatewayAuthorization` is your credential provider (returning, for example,
-`Bearer <gateway token>`). The SDK sends it in `Authorization` and sends agent
-auth in `x-avo-agent-authorization`. The callback runs per request so expiring
-credentials can refresh. Public reads omit agent auth. Direct market-service
-clients omit `gatewayAuthorization` and retain the existing header behavior.
-Never log either credential. The old standalone
-`portfolio-contract-api-service-dev.up.railway.app` URL is no longer a working
-service endpoint.
+`gatewayAuthorization` may also be a callback (it runs per request, so an expiring credential can refresh). The API key is required for market creation, registration and identity attach; it is optional for public reads and agent operations, where it raises your rate limit. Clients talking directly to market-service omit `gatewayAuthorization`. Never log either credential.
 
-`rebalance()` invokes the server's prepare → swap legs → settle orchestration;
-the service builds, signs and submits transactions. Sig authentication proves
-API identity; it does not turn this endpoint into an unsigned transaction
-builder. There are no separate build, sign, submit or settle methods in this
-HTTP SDK. `updateNav()` also signs and submits on the server.
+`rebalance()` invokes the server's prepare → swap legs → settle orchestration; the service builds, signs and submits transactions. Sig authentication proves API identity; it does not turn this endpoint into an unsigned transaction builder. There are no separate build, sign, submit or settle methods in this HTTP SDK. `updateNav()` also signs and submits on the server.
 
-For read-only validation use `getQuote()`, `getValue()` and
-`simulateRebalance()`. The last method plans and quotes; it does **not** run
-Solana transaction simulation or validate settlement. Reject unroutable legs
-(`unroutable`, `unroutableReason`) and independently check execution loss.
-`estimatedTotalValueAfterBase` deducts estimated fees; it is not proof of a
-maximum market-impact loss. Slippage of 200 bps alone does not prove a 2% loss
-limit against a reference value.
+For read-only validation use `getQuote()`, `getValue()` and `simulateRebalance()`. The last method plans and quotes; it does **not** run Solana transaction simulation or validate settlement. Reject unroutable legs (`unroutable`, `unroutableReason`) and independently check execution loss. `estimatedTotalValueAfterBase` deducts estimated fees; it is not proof of a maximum market-impact loss.
 
-Keep `onlyDirectRoutes` false or omitted for assets requiring multiple hops.
-Rebalance accepts `excludeDexes` (for example `Scorch`), `feeSlippageBps`,
-`dustThresholdBps`, `acceptLowAumTopup` and `progressId`. The simulation endpoint
-accepts dust thresholds but does not exercise the rebalance router filters or
-fee-conversion swaps. Router-filter serialization is not proof of enforcement:
-market-service deployment `541e307e` accepts these fields but does not forward
-them from its execution service to the orchestrator. Its dFlow adapter already statically excludes Scorch, but workers must verify
-that protection in route evidence; arbitrary caller filters need backend
-forwarding before they can be relied upon.
-`dustThresholdBase` takes precedence over bps. Server dust
-defaults vary by market; pass an explicit value when comparing preview and run.
+Keep `onlyDirectRoutes` false or omitted for assets requiring multiple hops. Rebalance accepts `dexes` / `excludeDexes` (forwarded to every router quote), `feeSlippageBps`, `dustThresholdBps`, `acceptLowAumTopup` and `progressId`. The simulation endpoint accepts dust thresholds but does not exercise the rebalance router filters or fee-conversion swaps. `dustThresholdBase` takes precedence over bps; server dust defaults vary by market, so pass an explicit value when comparing preview and run.
 
-A failed rebalance may arrive as HTTP 200 after keepalive whitespace, containing
-`__rebalanceError`. Version 0.2.1 throws `AvoSdkError` with its status, code,
-message and details. There is no automatic retry: execution may already be
-partially applied. Inspect the market/plan before retrying. Successful
-`driftAutoSuccess` responses can have empty signatures when existing weights
-are already acceptable; they do not mean new transactions landed.
+A failed rebalance may arrive as HTTP 200 after keepalive whitespace, containing `__rebalanceError`; `rebalance()` throws it as `AvoSdkError` with its status, code, message and details. There is no automatic retry: execution may already be partially applied. Inspect the market before retrying. Successful `driftAutoSuccess` responses can have empty signatures when existing weights are already acceptable; they do not mean new transactions landed.

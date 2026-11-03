@@ -13,6 +13,10 @@
 // ---------------------------------------------------------------------------
 export {
   MarketClient,
+  RETRYABLE_FINALIZE_CODES,
+  MAX_FINALIZE_ATTEMPTS,
+  DEFAULT_FINALIZE_DEADLINE_MS,
+  MAX_FINALIZE_DEADLINE_MS,
   buildAttachMessage,
   type MarketClientConfig,
   type CreateMarketWithShadowPortfolioOpts,
@@ -78,6 +82,8 @@ export type {
   ListMarketsResp,
   MarketSummary,
   AgentRatingBlock,
+  DepositMinimumSummary,
+  MarketEligibility,
   MarketEvent,
   MarketEventsResp,
   GetMarketEventsParams,

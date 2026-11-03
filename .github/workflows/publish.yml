@@ -68,7 +68,13 @@ jobs:
     name: Publish to npm
     needs: check
     if: needs.check.outputs.should_publish == 'true'
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    # Must be a GitHub-hosted runner. npm trusted publishing and provenance only
+    # accept github-hosted runners; the one publish attempted from a Blacksmith
+    # (self-hosted) runner failed with E422 "Unsupported GitHub Actions runner
+    # environment: self-hosted" (run 40987908548). The check job can stay on
+    # Blacksmith. If GitHub-hosted minutes are unavailable this job fails before
+    # anything is published; publish manually in that case.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -111,8 +117,10 @@ jobs:
       - name: Test
         run: yarn test
 
+      # OIDC trusted publishing (no token). Provenance is explicit: it needs the
+      # GitHub-hosted runner above and this public repository.
       - name: Publish with GitHub OIDC
-        run: npm publish --access public
+        run: npm publish --access public --provenance
 
       - name: Summary
         run: |

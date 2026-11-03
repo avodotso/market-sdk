@@ -3,6 +3,7 @@ import { describe, it, expect } from 'vitest';
 import nacl from 'tweetnacl';
 import bs58 from 'bs58';
 import {
+  AvoSdkError,
   MarketClient,
   FINALIZE_AUTH_AUDIENCE,
   buildCreatorAuth,
@@ -324,6 +325,80 @@ describe('MarketClient.createMarketWithShadowPortfolio', () => {
     expect(slept).toEqual([2000, 2000]);
     const auths = calls.slice(1).map((c) => c.body.creatorAuth);
     expect(new Set(auths.map((a: string) => a.split('.')[2])).size).toBe(3);
+  });
+
+  it('retries FUNDING_TX_NOT_FINALIZED (confirmed, not final yet) the same way', async () => {
+    const notFinalized: Reply = {
+      status: 409,
+      body: { error: { code: 'FUNDING_TX_NOT_FINALIZED', message: 'confirmed, not finalized' } },
+      headers: { 'retry-after': '5' },
+    };
+    const { fn, calls } = fakeApi(prepOk, [notFound, notFinalized]);
+    const client = new MarketClient({ services: { avoApi: 'https://avo-api.test' }, fetch: fn });
+    const slept: number[] = [];
+    const out = await client.createMarketWithShadowPortfolio(prepBody, async () => FUNDING_SIG, signCreator, {
+      sleep: async (ms) => void slept.push(ms),
+    });
+    expect(out.bearer).toBe('mb_x');
+    expect(slept).toEqual([2000, 5000]);
+    const nonces = calls.slice(1).map((c) => (c.body.creatorAuth as string).split('.')[2]);
+    expect(new Set(nonces).size).toBe(3);
+  });
+
+  it.each([
+    ['Infinity attempts', { maxFinalizeAttempts: Infinity }],
+    ['NaN attempts', { maxFinalizeAttempts: NaN }],
+    ['zero attempts', { maxFinalizeAttempts: 0 }],
+    ['negative attempts', { maxFinalizeAttempts: -1 }],
+    ['fractional attempts', { maxFinalizeAttempts: 2.5 }],
+    ['attempts over the cap', { maxFinalizeAttempts: 21 }],
+    ['Infinity deadline', { finalizeDeadlineMs: Infinity }],
+    ['deadline under 1s', { finalizeDeadlineMs: 999 }],
+    ['deadline over the cap', { finalizeDeadlineMs: 900_001 }],
+  ])('refuses %s before prepare, so nothing is funded', async (_name, opts) => {
+    const { fn, calls } = fakeApi(prepOk);
+    const client = new MarketClient({ services: { avoApi: 'https://avo-api.test' }, fetch: fn });
+    let funded = false;
+    await expect(
+      client.createMarketWithShadowPortfolio(prepBody, async () => { funded = true; return FUNDING_SIG; }, signCreator, opts),
+    ).rejects.toMatchObject({ code: 'INVALID_FINALIZE_OPTIONS' });
+    expect(calls).toHaveLength(0);
+    expect(funded).toBe(false);
+  });
+
+  it('accepts up to 20 attempts', async () => {
+    const { fn, calls } = fakeApi(prepOk, Array.from({ length: 19 }, () => notFound));
+    const client = new MarketClient({ services: { avoApi: 'https://avo-api.test' }, fetch: fn });
+    const out = await client.createMarketWithShadowPortfolio(prepBody, async () => FUNDING_SIG, signCreator, {
+      maxFinalizeAttempts: 20,
+      finalizeDeadlineMs: 900_000,
+      sleep: async () => {},
+    });
+    expect(out.bearer).toBe('mb_x');
+    expect(calls.length - 1).toBe(20);
+  });
+
+  it('starts no new attempt past the wall-clock deadline, with recovery details', async () => {
+    const { fn, calls } = fakeApi(prepOk, Array.from({ length: 10 }, () => notFound));
+    const client = new MarketClient({ services: { avoApi: 'https://avo-api.test' }, fetch: fn });
+    let clock = 1_000_000;
+    const err = await client
+      .createMarketWithShadowPortfolio(prepBody, async () => FUNDING_SIG, signCreator, {
+        maxFinalizeAttempts: 10,
+        finalizeDeadlineMs: 5_000,
+        now: () => clock,
+        sleep: async (ms) => { clock += ms; },
+      })
+      .catch((e: AvoSdkError) => e);
+    // Retry-After is 2 s: attempts at t=0, 2 s and 4 s; the next would start at 6 s > 5 s.
+    expect(calls.length - 1).toBe(3);
+    expect(err).toMatchObject({ code: 'FUNDING_TX_NOT_FOUND' });
+    expect((err as AvoSdkError).details).toMatchObject({
+      pendingId: PENDING_ID,
+      agentPubkey: AGENT,
+      fundingSignature: FUNDING_SIG,
+      deadlineExceeded: true,
+    });
   });
 
   it('gives up after maxFinalizeAttempts with recovery details and retryAfterMs', async () => {

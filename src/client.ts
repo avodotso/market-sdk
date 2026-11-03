@@ -103,13 +103,42 @@ export interface MarketClientAgent {
   bearer?: string;
 }
 
-const RETRYABLE_FINALIZE_CODES = new Set(['FUNDING_TX_NOT_FOUND', 'FUNDING_TX_LOOKUP_FAILED']);
+/** Finalize refusals a fresh creatorAuth fixes after `Retry-After`: the funding
+ *  transfer is not visible yet, not finalized yet, or could not be looked up.
+ *  Finalize's 503s (`FINALIZE_IN_PROGRESS`, `FINALIZE_LEASE_LOST`,
+ *  `FINALIZE_LOOKUP_TABLE_UNRESOLVED`, `FINALIZE_UNAVAILABLE`) are deliberately
+ *  absent: another finalize for the agent is running or unsettled, and retrying
+ *  can converge on that market with an empty bearer. */
+export const RETRYABLE_FINALIZE_CODES: ReadonlySet<string> = new Set([
+  'FUNDING_TX_NOT_FOUND',
+  'FUNDING_TX_NOT_FINALIZED',
+  'FUNDING_TX_LOOKUP_FAILED',
+]);
+
+/** Hard cap on `maxFinalizeAttempts`: every attempt re-signs with the creator wallet. */
+export const MAX_FINALIZE_ATTEMPTS = 20;
+/** Default wall-clock budget for starting finalize attempts, measured from funding. */
+export const DEFAULT_FINALIZE_DEADLINE_MS = 180_000;
+/** Hard cap on `finalizeDeadlineMs`. */
+export const MAX_FINALIZE_DEADLINE_MS = 900_000;
 
 export interface CreateMarketWithShadowPortfolioOpts {
-  /** Total finalize attempts while funding is unconfirmed. Default 4. */
+  /** Total finalize attempts while funding is not finalized. Integer 1..20, default 4. */
   maxFinalizeAttempts?: number;
+  /**
+   * Wall-clock budget in ms, from funding, after which no new finalize attempt
+   * starts. Integer 1_000..900_000, default 180_000. An attempt already sent is
+   * never cut short (its work runs server-side).
+   */
+  finalizeDeadlineMs?: number;
   /** Delay override, for tests. */
   sleep?: (ms: number) => Promise<void>;
+  /** Clock override, for tests. Default `Date.now`. */
+  now?: () => number;
+}
+
+function boundedInteger(value: number, min: number, max: number): boolean {
+  return Number.isInteger(value) && value >= min && value <= max;
 }
 
 export interface MarketClientConfig extends HttpBaseConfig {
@@ -253,8 +282,9 @@ export class MarketClient extends HttpBase {
    * `signMessage`, returning the 64-byte Ed25519 signature). This SDK never
    * touches the operator's signing material.
    *
-   * Finalize is retried on `FUNDING_TX_NOT_FOUND` (funding not yet
-   * confirmed) and `FUNDING_TX_LOOKUP_FAILED` up to `opts.maxFinalizeAttempts` times (default 4), honouring
+   * Finalize is retried on `FUNDING_TX_NOT_FOUND` (funding not landed yet),
+   * `FUNDING_TX_NOT_FINALIZED` (landed but not final yet) and
+   * `FUNDING_TX_LOOKUP_FAILED` up to `opts.maxFinalizeAttempts` times (default 4), honouring
    * `Retry-After`. Each attempt needs a fresh single-use `creatorAuth`, so
    * `signMessage` is called once per attempt. Any error thrown after funding
    * carries `details.pendingId`, `details.agentPubkey` and
@@ -289,6 +319,18 @@ export class MarketClient extends HttpBase {
           'finalize creatorAuth with the creator wallet.',
       });
     }
+    // Validated before prepare: a bad option must fail before anything is funded.
+    const maxAttempts = opts.maxFinalizeAttempts ?? 4;
+    const deadlineMs = opts.finalizeDeadlineMs ?? DEFAULT_FINALIZE_DEADLINE_MS;
+    if (!boundedInteger(maxAttempts, 1, MAX_FINALIZE_ATTEMPTS) || !boundedInteger(deadlineMs, 1_000, MAX_FINALIZE_DEADLINE_MS)) {
+      throw new AvoSdkError({
+        status: 400,
+        code: 'INVALID_FINALIZE_OPTIONS',
+        message:
+          `createMarketWithShadowPortfolio: maxFinalizeAttempts must be an integer 1..${MAX_FINALIZE_ATTEMPTS} ` +
+          `and finalizeDeadlineMs an integer 1000..${MAX_FINALIZE_DEADLINE_MS}.`,
+      });
+    }
     const prep = await this.prepareCreateMarket(body);
     if (!prep.pendingId || typeof prep.pendingId !== 'string') {
       throw new AvoSdkError({
@@ -312,8 +354,9 @@ export class MarketClient extends HttpBase {
       });
     }
 
-    const maxAttempts = Math.max(1, Math.floor(opts.maxFinalizeAttempts ?? 4));
     const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+    const now = opts.now ?? Date.now;
+    const deadline = now() + deadlineMs;
     for (let attempt = 1; ; attempt++) {
       let creatorAuth: string;
       try {
@@ -343,15 +386,18 @@ export class MarketClient extends HttpBase {
         });
       } catch (err) {
         if (err instanceof AvoSdkError) {
-          if (RETRYABLE_FINALIZE_CODES.has(err.code) && attempt < maxAttempts) {
-            await sleep(Math.min(Math.max(err.retryAfterMs ?? 2000 * attempt, 500), 15_000));
+          const wait = Math.min(Math.max(err.retryAfterMs ?? 2000 * attempt, 500), 15_000);
+          const retryable = RETRYABLE_FINALIZE_CODES.has(err.code) && attempt < maxAttempts;
+          const withinDeadline = now() + wait <= deadline;
+          if (retryable && withinDeadline) {
+            await sleep(wait);
             continue;
           }
           throw new AvoSdkError({
             status: err.status,
             code: err.code,
             message: err.message,
-            details: { ...recovery, upstream: err.details },
+            details: { ...recovery, upstream: err.details, ...(retryable && !withinDeadline ? { deadlineExceeded: true } : {}) },
             retryAfterMs: err.retryAfterMs,
           });
         }
@@ -397,7 +443,14 @@ export class MarketClient extends HttpBase {
   listMarkets(params: ListMarketsParams = {}): Promise<ListMarketsResp> {
     return this.callAvo('GET', '/v1/markets', {
       auth: false,
-      query: { limit: params.limit, offset: params.offset },
+      query: {
+        limit: params.limit,
+        offset: params.offset,
+        includeClosed: params.includeClosed,
+        marketPda: params.marketPda,
+        portfolioServiceId: params.portfolioServiceId,
+        sort: params.sort,
+      },
     });
   }
 
