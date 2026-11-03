@@ -103,7 +103,13 @@ export interface MarketClientAgent {
   bearer?: string;
 }
 
-const RETRYABLE_FINALIZE_CODES = new Set(['FUNDING_TX_NOT_FOUND', 'FUNDING_TX_LOOKUP_FAILED']);
+/** Finalize refusals a fresh creatorAuth fixes after `Retry-After`: the funding
+ *  transfer is not visible yet, not finalized yet, or could not be looked up. */
+export const RETRYABLE_FINALIZE_CODES: ReadonlySet<string> = new Set([
+  'FUNDING_TX_NOT_FOUND',
+  'FUNDING_TX_NOT_FINALIZED',
+  'FUNDING_TX_LOOKUP_FAILED',
+]);
 
 export interface CreateMarketWithShadowPortfolioOpts {
   /** Total finalize attempts while funding is unconfirmed. Default 4. */
@@ -253,8 +259,9 @@ export class MarketClient extends HttpBase {
    * `signMessage`, returning the 64-byte Ed25519 signature). This SDK never
    * touches the operator's signing material.
    *
-   * Finalize is retried on `FUNDING_TX_NOT_FOUND` (funding not yet
-   * confirmed) and `FUNDING_TX_LOOKUP_FAILED` up to `opts.maxFinalizeAttempts` times (default 4), honouring
+   * Finalize is retried on `FUNDING_TX_NOT_FOUND` (funding not landed yet),
+   * `FUNDING_TX_NOT_FINALIZED` (landed but not final yet) and
+   * `FUNDING_TX_LOOKUP_FAILED` up to `opts.maxFinalizeAttempts` times (default 4), honouring
    * `Retry-After`. Each attempt needs a fresh single-use `creatorAuth`, so
    * `signMessage` is called once per attempt. Any error thrown after funding
    * carries `details.pendingId`, `details.agentPubkey` and

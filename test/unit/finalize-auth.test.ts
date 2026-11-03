@@ -326,6 +326,24 @@ describe('MarketClient.createMarketWithShadowPortfolio', () => {
     expect(new Set(auths.map((a: string) => a.split('.')[2])).size).toBe(3);
   });
 
+  it('retries FUNDING_TX_NOT_FINALIZED (confirmed, not final yet) the same way', async () => {
+    const notFinalized: Reply = {
+      status: 409,
+      body: { error: { code: 'FUNDING_TX_NOT_FINALIZED', message: 'confirmed, not finalized' } },
+      headers: { 'retry-after': '5' },
+    };
+    const { fn, calls } = fakeApi(prepOk, [notFound, notFinalized]);
+    const client = new MarketClient({ services: { avoApi: 'https://avo-api.test' }, fetch: fn });
+    const slept: number[] = [];
+    const out = await client.createMarketWithShadowPortfolio(prepBody, async () => FUNDING_SIG, signCreator, {
+      sleep: async (ms) => void slept.push(ms),
+    });
+    expect(out.bearer).toBe('mb_x');
+    expect(slept).toEqual([2000, 5000]);
+    const nonces = calls.slice(1).map((c) => (c.body.creatorAuth as string).split('.')[2]);
+    expect(new Set(nonces).size).toBe(3);
+  });
+
   it('gives up after maxFinalizeAttempts with recovery details and retryAfterMs', async () => {
     const { fn, calls } = fakeApi(prepOk, [notFound, notFound, notFound]);
     const client = new MarketClient({ services: { avoApi: 'https://avo-api.test' }, fetch: fn });

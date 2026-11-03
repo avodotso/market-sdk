@@ -69,7 +69,9 @@ export interface PrepareCreateMarketResp {
 
 export interface FinalizeCreateMarketBody {
   agentPubkey: string;
-  /** Signature of the funding transfer. */
+  /** Signature of the funding transfer. The API acts on it only once it is
+   *  finalized: until then finalize answers 409 `FUNDING_TX_NOT_FOUND` /
+   *  `FUNDING_TX_NOT_FINALIZED` with `Retry-After` (see `RETRYABLE_FINALIZE_CODES`). */
   fundingSignature: string;
   /** Creator-signed binding from `buildCreatorAuth`. Single-use and valid
    *  for at most 110s, so build a fresh one for every finalize attempt. */

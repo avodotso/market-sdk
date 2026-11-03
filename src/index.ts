@@ -13,6 +13,7 @@
 // ---------------------------------------------------------------------------
 export {
   MarketClient,
+  RETRYABLE_FINALIZE_CODES,
   buildAttachMessage,
   type MarketClientConfig,
   type CreateMarketWithShadowPortfolioOpts,
