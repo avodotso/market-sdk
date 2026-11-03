@@ -104,7 +104,11 @@ export interface MarketClientAgent {
 }
 
 /** Finalize refusals a fresh creatorAuth fixes after `Retry-After`: the funding
- *  transfer is not visible yet, not finalized yet, or could not be looked up. */
+ *  transfer is not visible yet, not finalized yet, or could not be looked up.
+ *  Finalize's 503s (`FINALIZE_IN_PROGRESS`, `FINALIZE_LEASE_LOST`,
+ *  `FINALIZE_LOOKUP_TABLE_UNRESOLVED`, `FINALIZE_UNAVAILABLE`) are deliberately
+ *  absent: another finalize for the agent is running or unsettled, and retrying
+ *  can converge on that market with an empty bearer. */
 export const RETRYABLE_FINALIZE_CODES: ReadonlySet<string> = new Set([
   'FUNDING_TX_NOT_FOUND',
   'FUNDING_TX_NOT_FINALIZED',

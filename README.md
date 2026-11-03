@@ -143,6 +143,8 @@ const result = await client.createMarketWithShadowPortfolio(
 
 The helper retries every code in `RETRYABLE_FINALIZE_CODES` (`FUNDING_TX_NOT_FOUND`, `FUNDING_TX_NOT_FINALIZED`, `FUNDING_TX_LOOKUP_FAILED`; up to 4 attempts by default, `{ maxFinalizeAttempts }` as a fourth argument), calling `signMessage` once per attempt. Any error it throws after funding carries `details.pendingId`, `details.agentPubkey` and `details.fundingSignature`, so you can finish with `buildCreatorAuth` + `finalizeCreateMarket`.
 
+It deliberately does **not** retry finalize's `503`s (`FINALIZE_IN_PROGRESS`, `FINALIZE_LEASE_LOST`, `FINALIZE_LOOKUP_TABLE_UNRESOLVED`, `FINALIZE_UNAVAILABLE`). They mean another finalize for the same agent is running, or one stopped part-way and has not settled. Retrying from here can converge on the market that other attempt is still creating, which returns `converged: true` with an **empty `bearer`**: the bearer goes to the attempt that created the market, so a helper that retried would hand you a market with no credential. Surface these to the caller instead: wait (`err.retryAfterMs` when set), check whether the market now exists, and finish with `finalizeCreateMarket` or rotate the bearer with `POST /v1/markets/bearer/rotate`.
+
 **Upgrading from 0.2.x:** `finalizeCreateMarket` now requires `creatorAuth`, and `createMarketWithShadowPortfolio` takes a required third `signMessage` argument. Both must be signed by `body.creator`.
 
 ### Register a market you built on-chain yourself
