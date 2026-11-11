@@ -32,7 +32,7 @@
 import bs58 from 'bs58';
 
 import { HttpBase, type HttpBaseConfig } from './http-base';
-import { mintAuthToken, type SignerInput, type SignerFn } from './auth';
+import { REQUEST_SIG_DEFAULT_TTL_SECS, REQUEST_SIG_MAX_TTL_SECS, mintRequestSig, type SignerInput, type SignerFn } from './auth';
 import { AvoSdkError } from './errors';
 import { buildCreatorAuth } from './finalize-auth';
 import type {
@@ -150,14 +150,10 @@ export interface MarketClientConfig extends HttpBaseConfig {
    *  used only for bootstrap (`prepareCreateMarket` / `registerMarket`)
    *  or public reads (`listMarkets`, `healthz`, `getIdentity`). */
   agent?: MarketClientAgent;
-  /** Sig-token TTL in seconds. Ignored in bearer mode. Default 600s.
-   *  The API caps TTL server-side. */
+  /** Lifetime of each request-bound `Sig2`, in seconds. Ignored in bearer
+   *  mode. Default 60, capped at 120 (the API's ceiling). A fresh `Sig2` is
+   *  signed for every request; nothing is cached or reused. */
   tokenTtlSecs?: number;
-}
-
-interface CachedToken {
-  token: string;
-  expiresAtMs: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -171,7 +167,6 @@ export class MarketClient extends HttpBase {
    *  for `getOwnIdentity()` without satisfying Sig-auth invariants. */
   private readonly knownAgentPubkey: string | null;
   private readonly tokenTtlSecs: number;
-  private cached: CachedToken | null = null;
   private readonly gatewayAuthorization: MarketClientConfig['gatewayAuthorization'];
 
   constructor(cfg: MarketClientConfig = {}) {
@@ -225,7 +220,7 @@ export class MarketClient extends HttpBase {
       this.bearer = null;
       this.knownAgentPubkey = null;
     }
-    this.tokenTtlSecs = cfg.tokenTtlSecs ?? 600;
+    this.tokenTtlSecs = Math.min(cfg.tokenTtlSecs ?? REQUEST_SIG_DEFAULT_TTL_SECS, REQUEST_SIG_MAX_TTL_SECS);
   }
 
   /** The configured agent's base58 pubkey, or `null` for unauthenticated
@@ -640,22 +635,17 @@ export class MarketClient extends HttpBase {
     return out;
   }
 
-  /** Build the `Authorization` header value for an authenticated call.
-   *  Sig-auth mints + caches a token; bearer-auth stamps the static token. */
-  private async getAuthorizationHeader(): Promise<string> {
+  /** Build the `Authorization` header value for an authenticated call:
+   *  the static bearer in bearer mode, otherwise a `Sig2` bound to exactly
+   *  this request (method, path + query, body bytes, single-use nonce). */
+  private async getAuthorizationHeader(target: { method: string; url: string; body?: string }): Promise<string> {
     if (this.bearer) {
       return `Bearer ${this.bearer}`;
     }
     if (!this.signerInput) {
       throw this.notConfiguredError('auth');
     }
-    const refreshThresholdMs = 30_000;
-    if (this.cached && this.cached.expiresAtMs - Date.now() > refreshThresholdMs) {
-      return `Sig ${this.cached.token}`;
-    }
-    const minted = await mintAuthToken(this.signerInput, this.tokenTtlSecs);
-    this.cached = minted;
-    return `Sig ${minted.token}`;
+    return mintRequestSig(this.signerInput, target, { ttlSecs: this.tokenTtlSecs });
   }
 
   private notConfiguredError(forWhat: string): AvoSdkError {
@@ -688,10 +678,7 @@ export class MarketClient extends HttpBase {
       }
       headers.authorization = authorization;
     }
-    if (opts.auth !== false) {
-      headers[this.gatewayAuthorization !== undefined
-        ? 'x-avo-agent-authorization' : 'authorization'] = await this.getAuthorizationHeader();
-    }
+    const agentHeader = this.gatewayAuthorization !== undefined ? 'x-avo-agent-authorization' : 'authorization';
     return this.requestService<T>({
       baseUrl: this.services.avoApi,
       method,
@@ -699,6 +686,8 @@ export class MarketClient extends HttpBase {
       body: opts.body,
       headers,
       query: opts.query,
+      signHeaders: async (target) =>
+        opts.auth !== false ? { [agentHeader]: await this.getAuthorizationHeader(target) } : {},
     });
   }
 }

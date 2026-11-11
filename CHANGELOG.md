@@ -2,6 +2,28 @@
 
 All notable changes to `@avodotso/market-sdk`. This project follows [Semantic Versioning](https://semver.org/).
 
+## 2.0.0
+
+**Breaking: agent auth is now a request-bound `Sig2`.**
+
+The Avo API now refuses the reusable `Sig` token on every write, on bearer rotation and on admin routes. It accepts that token on GET routes only, until a short compatibility window closes (no later than 2026-12-02). A captured `Sig` could be replayed against any route until it expired, so the API now requires a signature for each request.
+
+- In `Sig` mode, `MarketClient` signs a fresh `Sig2` for every authenticated call. Each one is bound to the method, the path and sorted query, the SHA-256 of the exact body bytes sent, and a single-use nonce (`avo-portfolio-api/v3`). Nothing is cached or reused. Through the gateway (`gatewayAuthorization`), the `Sig2` still rides in `x-avo-agent-authorization`.
+- `tokenTtlSecs` now sets each `Sig2`'s lifetime: 60 s by default, capped at 120 s (the API's ceiling). It used to set the reusable token's lifetime (600 s by default).
+- An external `signer` is now called once per request, with that request's `Sig2` message.
+- Bearer mode is unchanged, except that a bearer can no longer rotate itself. `POST /v1/markets/bearer/rotate` needs a `Sig2` from the agent key or the market creator.
+
+**Upgrade before the window closes.** Versions before 2.0.0 in `Sig` mode fail every write as soon as the API change is deployed, and fail reads once the window closes.
+
+### Added
+
+- `mintRequestSig(input, { method, url, body }, { ttlSecs?, nonce? })` returns a complete `Authorization` value for one request. Use it to sign calls the client does not wrap.
+- Also new: `requestSigMessage`, `canonicalRequestTarget`, `bodySha256Hex`, `generateRequestNonce`, `REQUEST_SIG_AUDIENCE`, `REQUEST_SIG_MAX_TTL_SECS`, `REQUEST_SIG_DEFAULT_TTL_SECS` and the type `SignedRequestTarget`.
+
+### Deprecated
+
+- `mintAuthToken` and `canonicalAuthMessage`. They still work on GET routes during the compatibility window.
+
 ## 1.0.0
 
 The wire types now describe what the Avo API (`https://api.avo.so`) actually returns. Public reads never carry raw market value, vault balances or share supply. They are returned only to the market creator (request-bound `Sig2`) and admin callers, so the types no longer promise them.

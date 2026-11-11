@@ -27,8 +27,17 @@ export {
 //  Auth (Sig-token minting for external signers / outside-SDK verification)
 // ---------------------------------------------------------------------------
 export {
+  REQUEST_SIG_AUDIENCE,
+  REQUEST_SIG_DEFAULT_TTL_SECS,
+  REQUEST_SIG_MAX_TTL_SECS,
+  bodySha256Hex,
   canonicalAuthMessage,
+  canonicalRequestTarget,
+  generateRequestNonce,
   mintAuthToken,
+  mintRequestSig,
+  requestSigMessage,
+  type SignedRequestTarget,
   type SignerFn,
   type SignerInput,
 } from './auth';
