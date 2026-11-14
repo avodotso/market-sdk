@@ -237,17 +237,23 @@ Stamps `Authorization: Bearer <token>` on every agent-op call. The API hashes th
 
 - The bearer **cannot sign on-chain transactions outside our API** — it's not a Solana keypair.
 - The bearer **cannot withdraw the agent's keypair** — that material never leaves the API's at-rest encryption.
-- Rotation is one HTTP call: `POST /v1/markets/bearer/rotate` (body `{ marketPda }`).
+- Rotation is one HTTP call, `POST /v1/markets/bearer/rotate` (body `{ marketPda }`), signed with a request-bound `Sig2` from the agent key or the market creator's wallet. A bearer cannot rotate itself, so a leaked bearer cannot lock you out by minting its own replacement. Every rotation is audited and raises a notice on Avo's side.
 
 ### Sig (self-custodial)
 
-You hold the Ed25519 secret key yourself; the SDK mints a short-lived signed token over a canonical message:
+You hold the Ed25519 secret key yourself. For every call the SDK signs a fresh, single-use `Sig2` bound to that exact request:
 
 ```
-avo-portfolio-api/v1
+avo-portfolio-api/v3
 <agent pubkey base58>
 <expiresAt unix milliseconds>
+<nonce>
+<METHOD>
+<path>[?<query, keys sorted>]
+<sha256 hex of the exact body bytes; of "" when there is no body>
 ```
+
+and sends `Authorization: Sig2 <pubkey>.<expiresAt>.<nonce>.<bodySha256>.<signature>`. A captured header is useless on any other route, method, query or body, and the API accepts each nonce once.
 
 In-process secret:
 
@@ -277,18 +283,30 @@ new MarketClient({
 });
 ```
 
-Tokens are minted lazily and cached until ~30 s before expiry. TTL defaults to **600 s** (10 min); override with `tokenTtlSecs` on the constructor. The API caps TTL at its own `MAX_AUTH_TTL_SECS`, so over-long TTLs are clamped server-side.
+Each `Sig2` lives **60 s** by default; `tokenTtlSecs` can set up to 120 s, the API's ceiling. An external `signer` is called once per request.
 
-For minting tokens outside the SDK (e.g. server-side verifying its own auth):
+The client never falls back to reusable `Sig` after an authentication failure, and refuses HTTP redirects: a redirected request would have the wrong signed target or reuse a nonce. Configure the final API URL. Custom `fetch` implementations must honor `redirect: 'error'` and must not replay a captured request internally.
+
+For a retry, call the client method again to sign a fresh nonce and expiry. Preserve the operation's inputs and any server-supported idempotency identifier; never use the authentication nonce as that identifier. Rebalance has no guaranteed idempotency key (`progressId` is correlation only), so it is not retried automatically after an ambiguous response. Check its outcome before retrying. The finalize helper retries only its documented funding-read refusals, preserving the agent and funding signature while signing fresh creator consent each time.
+
+To sign a request the client does not wrap:
 
 ```ts
-import { canonicalAuthMessage, mintAuthToken } from '@avodotso/market-sdk';
+import { mintRequestSig } from '@avodotso/market-sdk';
 
-const { token, expiresAtMs } = await mintAuthToken({
-  publicKey: kp.publicKey.toBytes(),
-  secretKey: kp.secretKey,
-}, /* ttlSecs = */ 600);
+const body = JSON.stringify({ marketPda });
+const authorization = await mintRequestSig(
+  { publicKey: kp.publicKey.toBytes(), secretKey: kp.secretKey },
+  { method: 'POST', url: `${apiBase}/v1/markets/bearer/rotate`, body },
+);
+await fetch(`${apiBase}/v1/markets/bearer/rotate`, {
+  method: 'POST',
+  headers: { authorization, 'content-type': 'application/json' },
+  body, // exactly the bytes that were signed
+});
 ```
+
+The older reusable `Sig` (`mintAuthToken`, `avo-portfolio-api/v1`) is deprecated. The API accepts it only on GET routes during a short compatibility window, and never on writes, rotation or admin routes.
 
 ### Picking between them
 

@@ -17,8 +17,18 @@ import {
   AvoSdkError,
   AvoTransportError,
   buildAttachMessage,
-  canonicalAuthMessage,
+  canonicalRequestTarget,
+  mintRequestSig,
 } from '../../src/index';
+import { createHash } from 'node:crypto';
+
+/** Pinned in market-service and portfolio-internal tests too. */
+// Derived from market-service's own bodyBoundSigMessage/requestScope (seed 0x07*32,
+// POST /v1/markets/bearer/rotate?b=2&a=1, body {"marketPda":"M"}, nonce golden-nonce-0123456789,
+// now 1.8e12, TTL 60 s). The same string is pinned in market-service
+// test/unit/sig2-binding-bearer-rotation.test.ts and the other SDK's tests; change all three together.
+const GOLDEN_SIG2 =
+  'Sig2 GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB.1800000060000.golden-nonce-0123456789.f1d47fff107d7b5a1e8121b5322171dc5fe93775b82cbc8feac48b36183ae88e.2kiojno4SWR3UXv2C1ix3HLY3VDN2ycw4jXKmw7Vjjw4a9pnU6hiEGXN2Xj9jd4Tc6yRRL4xe2CaL3VpN3oMvwAY';
 
 const AVO_API = 'https://avo-api.test';
 
@@ -170,49 +180,86 @@ describe('MarketClient — bootstrap endpoints (no auth)', () => {
   });
 });
 
-describe('MarketClient — Sig auth', () => {
+describe('MarketClient — request-bound Sig2 auth', () => {
   let agent: ReturnType<typeof makeAgent>;
   beforeEach(() => {
     agent = makeAgent();
   });
 
-  it('produces an Authorization: Sig token with the agent pubkey on agent-op calls', async () => {
-    const { fn, requests } = captureFetch(() => jsonResponse({}));
-    const client = new MarketClient({
-      services: { avoApi: AVO_API },
-      fetch: fn,
-      agent: { publicKey: agent.publicKey, secretKey: agent.secretKey },
-    });
-    await client.getMarket();
-    const auth = requests[0].headers.authorization;
-    expect(auth).toBeTypeOf('string');
-    expect(auth.startsWith('Sig ')).toBe(true);
-    const [pubkey, expiresAtMs, sigB58] = auth.slice(4).split('.');
-    expect(pubkey).toBe(agent.pubkeyBase58);
-    expect(Number(expiresAtMs)).toBeGreaterThan(Date.now());
-    const msg = canonicalAuthMessage(pubkey, Number(expiresAtMs));
-    const sig = bs58.decode(sigB58);
-    expect(nacl.sign.detached.verify(msg, sig, agent.publicKey)).toBe(true);
-  });
+  /** Captures the exact body string sent, so the signed hash can be checked against it. */
+  function rawFetch() {
+    const sent: { url: string; method: string; headers: Record<string, string>; body: string }[] = [];
+    const fn: typeof fetch = async (input, init) => {
+      const headers = Object.fromEntries(
+        Object.entries((init?.headers ?? {}) as Record<string, string>).map(([k, v]) => [k.toLowerCase(), v]),
+      );
+      sent.push({
+        url: String(input),
+        method: (init?.method ?? 'GET').toUpperCase(),
+        headers,
+        body: typeof init?.body === 'string' ? init.body : '',
+      });
+      return jsonResponse({});
+    };
+    return { fn, sent };
+  }
 
-  it('caches the Sig token across calls until ~30s before expiry', async () => {
-    const { fn, requests } = captureFetch(() => jsonResponse({}));
+  /** Restated API verifier (market-service `verifyScopedSig`, v3 branch). */
+  function verifiesFor(header: string, req: { method: string; url: string; body: string }, pk: Uint8Array): boolean {
+    const m = /^Sig2 (.+)$/.exec(header);
+    if (!m) return false;
+    const [pubkey, exp, nonce, hash, sig] = m[1].split('.');
+    const u = new URL(req.url);
+    u.searchParams.sort();
+    const q = u.searchParams.toString();
+    const target = u.pathname + (q ? `?${q}` : '');
+    const bodyHash = createHash('sha256').update(req.body).digest('hex');
+    if (hash !== bodyHash) return false;
+    const msg = Buffer.from(
+      `avo-portfolio-api/v3\n${pubkey}\n${exp}\n${nonce}\n${req.method}\n${target}\n${bodyHash}`,
+      'utf8',
+    );
+    return nacl.sign.detached.verify(msg, bs58.decode(sig), pk);
+  }
+
+  it('signs each agent request with a fresh Sig2 bound to its method, path, query and exact body', async () => {
+    const { fn, sent } = rawFetch();
     const client = new MarketClient({
       services: { avoApi: AVO_API },
       fetch: fn,
       agent: { publicKey: agent.publicKey, secretKey: agent.secretKey },
-      tokenTtlSecs: 600,
     });
     await client.getMarket();
-    await client.getAssets();
     await client.getValue(50);
-    const auths = requests.map((r) => r.headers.authorization);
-    expect(auths[0]).toBe(auths[1]);
-    expect(auths[1]).toBe(auths[2]);
+    await client.updateNav({ totalValueBase: 123n } as never);
+    expect(sent).toHaveLength(3);
+    for (const req of sent) {
+      expect(req.headers.authorization.startsWith(`Sig2 ${agent.pubkeyBase58}.`)).toBe(true);
+      expect(verifiesFor(req.headers.authorization, req, agent.publicKey)).toBe(true);
+    }
+    const nonces = sent.map((r) => r.headers.authorization.split('.')[2]);
+    expect(new Set(nonces).size).toBe(3);
+    expect(verifiesFor(sent[0].headers.authorization, sent[1], agent.publicKey)).toBe(false);
+    expect(verifiesFor(sent[2].headers.authorization, { ...sent[2], body: sent[2].body + ' ' }, agent.publicKey)).toBe(false);
   });
 
-  it('delegates to an external signer when provided in place of secretKey', async () => {
-    const { fn, requests } = captureFetch(() => jsonResponse({}));
+  it('keeps the Sig2 lifetime within the API ceiling (default 60 s, capped at 120 s)', async () => {
+    const { fn, sent } = rawFetch();
+    const client = new MarketClient({
+      services: { avoApi: AVO_API },
+      fetch: fn,
+      agent: { publicKey: agent.publicKey, secretKey: agent.secretKey },
+      tokenTtlSecs: 3600,
+    });
+    const before = Date.now();
+    await client.getMarket();
+    const exp = Number(sent[0].headers.authorization.split('.')[1]);
+    expect(exp).toBeGreaterThan(before);
+    expect(exp - before).toBeLessThanOrEqual(121_000);
+  });
+
+  it('hands an external signer the Sig2 message for the request', async () => {
+    const { fn, sent } = rawFetch();
     const signer = vi.fn(async (msg: Uint8Array) => nacl.sign.detached(msg, agent.secretKey));
     const client = new MarketClient({
       services: { avoApi: AVO_API },
@@ -221,11 +268,101 @@ describe('MarketClient — Sig auth', () => {
     });
     await client.getMarket();
     expect(signer).toHaveBeenCalledTimes(1);
-    const args = signer.mock.calls[0];
-    const calledWith = args[0] as Uint8Array;
-    expect(calledWith.length).toBeGreaterThan(0);
-    expect(new TextDecoder().decode(calledWith).startsWith('avo-portfolio-api/v1\n')).toBe(true);
-    expect(requests[0].headers.authorization).toMatch(/^Sig /);
+    const text = new TextDecoder().decode(signer.mock.calls[0][0] as Uint8Array);
+    expect(text.startsWith(`avo-portfolio-api/v3\n${agent.pubkeyBase58}\n`)).toBe(true);
+    expect(text).toContain('\nGET\n/v1/market\n');
+    expect(verifiesFor(sent[0].headers.authorization, sent[0], agent.publicKey)).toBe(true);
+  });
+
+  it('through the gateway, the Sig2 rides in x-avo-agent-authorization and binds the same request', async () => {
+    const { fn, sent } = rawFetch();
+    const client = new MarketClient({
+      services: { avoApi: AVO_API },
+      fetch: fn,
+      gatewayAuthorization: 'Bearer gateway',
+      agent: { publicKey: agent.publicKey, secretKey: agent.secretKey },
+    });
+    await client.rebalance({ weights: [{ asset: 'base', weightBps: 10000 }] } as never);
+    expect(sent[0].headers.authorization).toBe('Bearer gateway');
+    expect(verifiesFor(sent[0].headers['x-avo-agent-authorization'], sent[0], agent.publicKey)).toBe(true);
+  });
+
+  it.each(['transport', 'unauthorized'] as const)('signs a caller retry after %s without replaying or downgrading credentials', async (failure) => {
+    const { fn, sent } = rawFetch();
+    const fetchImpl: typeof fetch = async (input, init) => {
+      await fn(input, init);
+      if (sent.length === 1) {
+        if (failure === 'transport') throw new Error('connection lost');
+        return jsonResponse({ error: { code: 'BAD_AUTH', message: 'refused' } }, 401);
+      }
+      return jsonResponse({});
+    };
+    const client = new MarketClient({
+      services: { avoApi: AVO_API }, fetch: fetchImpl,
+      agent: { publicKey: agent.publicKey, secretKey: agent.secretKey },
+    });
+    const operation = { weights: [{ asset: 'base', weightBps: 10000 }], progressId: 'same-operation' };
+    await expect(client.rebalance(operation)).rejects.toThrow();
+    expect(sent).toHaveLength(1); // No automatic retry of a possibly applied write.
+    await client.rebalance(operation);
+    expect(sent).toHaveLength(2);
+    expect(sent[1].body).toBe(sent[0].body);
+    expect(sent[1].url).toBe(sent[0].url);
+    const credentials = sent.map(req => req.headers.authorization);
+    expect(credentials[1].split('.')[2]).not.toBe(credentials[0].split('.')[2]);
+    for (const req of sent) expect(verifiesFor(req.headers.authorization, req, agent.publicKey)).toBe(true);
+  });
+
+  it('signs concurrent identical reads independently instead of sharing a cached nonce', async () => {
+    const { fn, sent } = rawFetch();
+    const client = new MarketClient({ services: { avoApi: AVO_API }, fetch: fn,
+      agent: { publicKey: agent.publicKey, secretKey: agent.secretKey } });
+    await Promise.all(Array.from({ length: 8 }, () => client.getMarket()));
+    expect(new Set(sent.map(req => req.headers.authorization.split('.')[2])).size).toBe(8);
+    for (const req of sent) expect(verifiesFor(req.headers.authorization, req, agent.publicKey)).toBe(true);
+  });
+
+  it('refuses automatic redirects so signed credentials cannot be replayed by fetch', async () => {
+    const fetchImpl = vi.fn(async (_input: unknown, init?: RequestInit) => {
+      expect(init?.redirect).toBe('error');
+      throw new TypeError('redirect refused');
+    });
+    const client = new MarketClient({ services: { avoApi: AVO_API }, fetch: fetchImpl,
+      agent: { publicKey: agent.publicKey, secretKey: agent.secretKey } });
+    await expect(client.getMarket()).rejects.toBeInstanceOf(AvoTransportError);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not send a request when the external signer fails', async () => {
+    const { fn, sent } = rawFetch();
+    const client = new MarketClient({ services: { avoApi: AVO_API }, fetch: fn,
+      agent: { publicKey: agent.publicKey, signer: async () => { throw new Error('signing unavailable'); } } });
+    await expect(client.getMarket()).rejects.toThrow('signing unavailable');
+    expect(sent).toHaveLength(0);
+  });
+});
+
+describe('mintRequestSig golden vector (shared with market-service and portfolio-internal)', () => {
+  it('produces the exact header the API verifier is pinned to', async () => {
+    const kp = nacl.sign.keyPair.fromSeed(new Uint8Array(32).fill(7));
+    const header = await mintRequestSig(
+      { publicKey: kp.publicKey, secretKey: kp.secretKey },
+      { method: 'post', url: 'https://x.test/v1/markets/bearer/rotate?b=2&a=1', body: '{"marketPda":"M"}' },
+      { nonce: 'golden-nonce-0123456789', now: 1_800_000_000_000, ttlSecs: 60 },
+    );
+    expect(header).toBe(GOLDEN_SIG2);
+  });
+
+  it('canonicalRequestTarget sorts the query like the API', () => {
+    expect(canonicalRequestTarget('https://x.test/v1/value?slippageBps=5&a=b')).toBe('/v1/value?a=b&slippageBps=5');
+    expect(canonicalRequestTarget('/v1/market')).toBe('/v1/market');
+  });
+
+  it('refuses a TTL above the API ceiling and a malformed nonce', async () => {
+    const kp = nacl.sign.keyPair();
+    const input = { publicKey: kp.publicKey, secretKey: kp.secretKey };
+    await expect(mintRequestSig(input, { method: 'GET', url: '/v1/market' }, { ttlSecs: 121 })).rejects.toThrow(/ttlSecs/);
+    await expect(mintRequestSig(input, { method: 'GET', url: '/v1/market' }, { nonce: 'short' })).rejects.toThrow(/nonce/);
   });
 });
 
@@ -632,14 +769,14 @@ describe('MarketClient — current service compatibility', () => {
     expect(requests).toHaveLength(0);
   });
 
-  it('relays Sig auth through the gateway without replacing its credential', async () => {
+  it('relays Sig2 auth through the gateway without replacing its credential', async () => {
     const agent = makeAgent();
     const { fn, requests } = captureFetch(() => jsonResponse({}));
     const client = new MarketClient({ services: { avoApi: AVO_API }, fetch: fn,
       gatewayAuthorization: 'Bearer gateway', agent });
     await client.getQuote({ from: 'A', to: 'B', amount: 1n, onlyDirectRoutes: false });
     expect(requests[0].headers.authorization).toBe('Bearer gateway');
-    expect(requests[0].headers['x-avo-agent-authorization']).toMatch(/^Sig /);
+    expect(requests[0].headers['x-avo-agent-authorization']).toMatch(/^Sig2 /);
     expect(new URL(requests[0].url).searchParams.get('onlyDirectRoutes')).toBe('false');
   });
 

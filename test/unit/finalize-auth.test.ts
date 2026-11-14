@@ -343,6 +343,11 @@ describe('MarketClient.createMarketWithShadowPortfolio', () => {
     expect(slept).toEqual([2000, 5000]);
     const nonces = calls.slice(1).map((c) => (c.body.creatorAuth as string).split('.')[2]);
     expect(new Set(nonces).size).toBe(3);
+    // Auth freshness must not create a new funded operation on retry.
+    for (const call of calls.slice(1)) {
+      expect(call.body.agentPubkey).toBe(prepOk.agentPubkey);
+      expect(call.body.fundingSignature).toBe(FUNDING_SIG);
+    }
   });
 
   it.each([

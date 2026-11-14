@@ -47,6 +47,12 @@ export class HttpBase {
     body?: unknown;
     headers?: Record<string, string>;
     query?: Record<string, string | number | boolean | undefined>;
+    /**
+     * Headers computed from the final request: method, full URL and the exact
+     * body string sent. A request-bound `Sig2` is minted here, after both are
+     * fixed, so the API's body and query binding match what goes on the wire.
+     */
+    signHeaders?: (target: { method: string; url: string; body?: string }) => Promise<Record<string, string>>;
   }): Promise<T> {
     if (!opts.baseUrl) {
       throw new AvoSdkError({
@@ -58,19 +64,24 @@ export class HttpBase {
       });
     }
 
+    const url = buildUrl(opts.baseUrl, opts.path, opts.query);
+    const body = opts.body !== undefined ? JSON.stringify(opts.body) : undefined;
+
     const headers: Record<string, string> = {
       ...(opts.body !== undefined ? { 'content-type': 'application/json' } : {}),
       ...(opts.headers ?? {}),
+      ...(opts.signHeaders ? await opts.signHeaders({ method: opts.method, url, body }) : {}),
     };
-
-    const url = buildUrl(opts.baseUrl, opts.path, opts.query);
 
     let res: Response;
     try {
       res = await this.fetchImpl(url, {
         method: opts.method,
         headers,
-        body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+        body,
+        // A redirect changes the signed target or reuses a single-use nonce.
+        // The caller must choose the endpoint and sign a new request instead.
+        redirect: 'error',
       });
     } catch (err) {
       throw new AvoTransportError(
