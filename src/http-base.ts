@@ -79,6 +79,9 @@ export class HttpBase {
         method: opts.method,
         headers,
         body,
+        // A redirect changes the signed target or reuses a single-use nonce.
+        // The caller must choose the endpoint and sign a new request instead.
+        redirect: 'error',
       });
     } catch (err) {
       throw new AvoTransportError(

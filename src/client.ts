@@ -20,9 +20,9 @@
  *     returned by `finalizeCreateMarket` / `registerMarket`. You never
  *     touch a private key.
  *
- *   • **Self-custodial (Sig)** — `agent: { publicKey, secretKey }` (or
- *     `signer`). You hold the keypair; the SDK mints short-lived signed
- *     tokens over a canonical message on every call window. External
+ *   • **Self-custodial (Sig2)** — `agent: { publicKey, secretKey }` (or
+ *     `signer`). You hold the keypair; the SDK signs the method, target and
+ *     exact body with a fresh nonce for every request. External
  *     signers (KMS / hardware wallet / Turnkey / etc.) supported via the
  *     `signer: SignerFn` slot in place of `secretKey`.
  *

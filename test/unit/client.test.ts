@@ -286,6 +286,60 @@ describe('MarketClient — request-bound Sig2 auth', () => {
     expect(sent[0].headers.authorization).toBe('Bearer gateway');
     expect(verifiesFor(sent[0].headers['x-avo-agent-authorization'], sent[0], agent.publicKey)).toBe(true);
   });
+
+  it.each(['transport', 'unauthorized'] as const)('signs a caller retry after %s without replaying or downgrading credentials', async (failure) => {
+    const { fn, sent } = rawFetch();
+    const fetchImpl: typeof fetch = async (input, init) => {
+      await fn(input, init);
+      if (sent.length === 1) {
+        if (failure === 'transport') throw new Error('connection lost');
+        return jsonResponse({ error: { code: 'BAD_AUTH', message: 'refused' } }, 401);
+      }
+      return jsonResponse({});
+    };
+    const client = new MarketClient({
+      services: { avoApi: AVO_API }, fetch: fetchImpl,
+      agent: { publicKey: agent.publicKey, secretKey: agent.secretKey },
+    });
+    const operation = { weights: [{ asset: 'base', weightBps: 10000 }], progressId: 'same-operation' };
+    await expect(client.rebalance(operation)).rejects.toThrow();
+    expect(sent).toHaveLength(1); // No automatic retry of a possibly applied write.
+    await client.rebalance(operation);
+    expect(sent).toHaveLength(2);
+    expect(sent[1].body).toBe(sent[0].body);
+    expect(sent[1].url).toBe(sent[0].url);
+    const credentials = sent.map(req => req.headers.authorization);
+    expect(credentials[1].split('.')[2]).not.toBe(credentials[0].split('.')[2]);
+    for (const req of sent) expect(verifiesFor(req.headers.authorization, req, agent.publicKey)).toBe(true);
+  });
+
+  it('signs concurrent identical reads independently instead of sharing a cached nonce', async () => {
+    const { fn, sent } = rawFetch();
+    const client = new MarketClient({ services: { avoApi: AVO_API }, fetch: fn,
+      agent: { publicKey: agent.publicKey, secretKey: agent.secretKey } });
+    await Promise.all(Array.from({ length: 8 }, () => client.getMarket()));
+    expect(new Set(sent.map(req => req.headers.authorization.split('.')[2])).size).toBe(8);
+    for (const req of sent) expect(verifiesFor(req.headers.authorization, req, agent.publicKey)).toBe(true);
+  });
+
+  it('refuses automatic redirects so signed credentials cannot be replayed by fetch', async () => {
+    const fetchImpl = vi.fn(async (_input: unknown, init?: RequestInit) => {
+      expect(init?.redirect).toBe('error');
+      throw new TypeError('redirect refused');
+    });
+    const client = new MarketClient({ services: { avoApi: AVO_API }, fetch: fetchImpl,
+      agent: { publicKey: agent.publicKey, secretKey: agent.secretKey } });
+    await expect(client.getMarket()).rejects.toBeInstanceOf(AvoTransportError);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not send a request when the external signer fails', async () => {
+    const { fn, sent } = rawFetch();
+    const client = new MarketClient({ services: { avoApi: AVO_API }, fetch: fn,
+      agent: { publicKey: agent.publicKey, signer: async () => { throw new Error('signing unavailable'); } } });
+    await expect(client.getMarket()).rejects.toThrow('signing unavailable');
+    expect(sent).toHaveLength(0);
+  });
 });
 
 describe('mintRequestSig golden vector (shared with market-service and portfolio-internal)', () => {

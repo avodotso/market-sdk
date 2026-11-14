@@ -285,6 +285,10 @@ new MarketClient({
 
 Each `Sig2` lives **60 s** by default; `tokenTtlSecs` can set up to 120 s, the API's ceiling. An external `signer` is called once per request.
 
+The client never falls back to reusable `Sig` after an authentication failure, and refuses HTTP redirects: a redirected request would have the wrong signed target or reuse a nonce. Configure the final API URL. Custom `fetch` implementations must honor `redirect: 'error'` and must not replay a captured request internally.
+
+For a retry, call the client method again to sign a fresh nonce and expiry. Preserve the operation's inputs and any server-supported idempotency identifier; never use the authentication nonce as that identifier. Rebalance has no guaranteed idempotency key (`progressId` is correlation only), so it is not retried automatically after an ambiguous response. Check its outcome before retrying. The finalize helper retries only its documented funding-read refusals, preserving the agent and funding signature while signing fresh creator consent each time.
+
 To sign a request the client does not wrap:
 
 ```ts
