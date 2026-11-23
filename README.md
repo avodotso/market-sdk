@@ -46,9 +46,9 @@ await client.rebalance({
 await client.updateNav();
 ```
 
-### Operate a market (self-custodial — Sig auth)
+### Operate a market (self-custodial — Sig2 auth)
 
-You hold the agent's 64-byte Ed25519 secret key yourself; the SDK mints fresh signed tokens on every call window.
+You hold the agent's 64-byte Ed25519 secret key yourself; the SDK signs a fresh, single-use, request-bound `Sig2` for every call.
 
 ```ts
 import { MarketClient } from '@avodotso/market-sdk';
@@ -124,7 +124,7 @@ declare const secrets: { set(name: string, value: string): Promise<void> };
 if (result.converged || !result.bearer) {
   // An earlier finalize already created this market and issued its bearer; it
   // is never re-issued. Keep the one you stored. If you no longer have it, mint
-  // a new one: POST /v1/markets/bearer/rotate { marketPda } as the creator.
+  // a new one: POST /v1/markets/bearer/rotate { marketPda }, signed with the creator's Sig2 (mintRequestSig).
   throw new Error(`market ${result.marketPda} already existed; not saving an empty bearer`);
 }
 await secrets.set(`avo/markets/${result.marketPda}/bearer`, result.bearer);
@@ -217,7 +217,7 @@ Public reads never include raw market value, vault balances or share supply: `Ma
 
 ### Bearer (custodial)
 
-The agent's secret key stays encrypted inside the API. You only hold the one-time bearer returned by `finalizeCreateMarket` / `registerMarket`. **Recommended default** for hosted market-makers — no key management on your side, and the bearer is a single short string you can rotate with `POST /v1/markets/bearer/rotate` (as the agent, or as the creator with a creator `Sig`), or by re-registering a market you registered yourself.
+The agent's secret key stays encrypted inside the API. You only hold the one-time bearer returned by `finalizeCreateMarket` / `registerMarket`. **Recommended default** for hosted market-makers — no key management on your side, and the bearer is a single short string you can rotate with `POST /v1/markets/bearer/rotate` (with a request-bound `Sig2` from the agent key or the creator's wallet; a bearer cannot rotate itself), or by re-registering a market you registered yourself.
 
 ```ts
 import { MarketClient } from '@avodotso/market-sdk';
@@ -306,7 +306,7 @@ await fetch(`${apiBase}/v1/markets/bearer/rotate`, {
 });
 ```
 
-The older reusable `Sig` (`mintAuthToken`, `avo-portfolio-api/v1`) is deprecated. The API accepts it only on GET routes during a short compatibility window, and never on writes, rotation or admin routes.
+The older reusable `Sig` (`mintAuthToken`, `avo-portfolio-api/v1`) is retired. The API refuses it on every route, reads included, with `401 LEGACY_SIG_RETIRED`. There is no compatibility window: use `Sig2` (or a bearer) everywhere.
 
 ### Picking between them
 
